@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "prism": {
+      "command": "C:\\Users\\rebel\\GolandProjects\\TokenCompressorUI\\prism.exe",
+      "args": ["serve", "-db", "C:\\path\\to\\your\\project\\code_graph.db"]
+    }
+  }
+}

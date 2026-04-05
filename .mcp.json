@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "prism": {
+      "type": "stdio",
+      "args": [
+        "serve",
+        "-db",
+        "C:\\Users\\rebel\\GolandProjects\\TokenCompressorUI\\code_graph.db"
+      ],
+      "command": "C:\\Users\\rebel\\GolandProjects\\TokenCompressorUI\\prism.exe"
+    }
+  }
+}
