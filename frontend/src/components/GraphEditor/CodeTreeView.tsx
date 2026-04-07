@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { TreeNode } from './TreeNode';
 import { EditNodePanel } from './EditNodePanel';
+import { GraphViz } from '../GraphViz';
 import { Search, AlertCircle, FileText, Loader } from 'lucide-react';
 
 interface TreeNodeData {
@@ -30,9 +31,12 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
+  const [callEdges, setCallEdges] = useState<{ source: string; target: string; type: 'calls' }[]>([]);
+  const [blastRadius, setBlastRadius] = useState<{ level1: string[]; level2: string[] } | undefined>();
 
   useEffect(() => {
     loadFiles();
+    loadCallEdges();
   }, []);
 
   const loadFiles = async () => {
@@ -58,6 +62,17 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
       console.error(err);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const loadCallEdges = async () => {
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/graph/edges`);
+      if (!response.ok) return;
+      const data = await response.json();
+      setCallEdges((data.edges || []).map((e: any) => ({ ...e, type: 'calls' as const })));
+    } catch {
+      // silently ignore
     }
   };
 
@@ -100,16 +115,29 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
 
   const handleSelectNode = async (node: TreeNodeData) => {
     try {
-      const response = await fetch(
-        `${apiBaseUrl}/api/node/full?id=${encodeURIComponent(node.id)}`
-      );
-      if (!response.ok) throw new Error('Failed to load node');
+      const [nodeRes, impactRes] = await Promise.all([
+        fetch(`${apiBaseUrl}/api/node/full?id=${encodeURIComponent(node.id)}`),
+        fetch(`${apiBaseUrl}/api/node/impact?id=${encodeURIComponent(node.id)}`),
+      ]);
 
-      const data = await response.json();
-      setSelectedNode(data.node);
+      if (nodeRes.ok) {
+        const data = await nodeRes.json();
+        setSelectedNode(data.node);
+      } else {
+        setSelectedNode(node);
+      }
+
+      if (impactRes.ok) {
+        const impact = await impactRes.json();
+        if (impact.level1?.length > 0 || impact.level2?.length > 0) {
+          setBlastRadius({ level1: impact.level1 || [], level2: impact.level2 || [] });
+        } else {
+          setBlastRadius(undefined);
+        }
+      }
     } catch (err) {
-      console.error('Error loading node:', err);
       setSelectedNode(node);
+      setBlastRadius(undefined);
     }
   };
 
@@ -142,10 +170,32 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
     node.file.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
+  const graphNodes = useMemo(() => {
+    return treeData.flatMap((file) => [
+      { id: file.id, name: file.name, type: file.type },
+      ...(file.children || []).map((child) => ({
+        id: child.id,
+        name: child.name,
+        type: child.type,
+      })),
+    ]);
+  }, [treeData]);
+
+  const graphEdges = useMemo(() => {
+    const containsEdges = treeData.flatMap((file) =>
+      (file.children || []).map((child) => ({
+        source: file.id,
+        target: child.id,
+        type: 'contains' as const,
+      }))
+    );
+    return [...containsEdges, ...callEdges];
+  }, [treeData, callEdges]);
+
   return (
     <div className="flex h-full bg-slate-900">
       {/* Left Sidebar - Tree */}
-      <div className="w-1/3 border-r border-slate-700/50 flex flex-col bg-slate-950 backdrop-blur-sm">
+      <div className="w-1/4 border-r border-slate-700/50 flex flex-col bg-slate-950 backdrop-blur-sm">
         {/* Search Bar */}
         <div className="p-4 border-b border-slate-700/50 bg-slate-950/50">
           <div className="relative group">
@@ -203,13 +253,30 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
         </div>
       </div>
 
+      {/* Center - Graph Visualization */}
+      <div className="flex-1 border-r border-slate-700/50">
+        <GraphViz
+          nodes={graphNodes}
+          edges={graphEdges}
+          highlightIds={blastRadius}
+          onNodeClick={(nodeId) => {
+            const flat = treeData.flatMap((f) => [f, ...(f.children || [])]);
+            const found = flat.find((n) => n.id === nodeId);
+            if (found) handleSelectNode(found);
+          }}
+        />
+      </div>
+
       {/* Right Sidebar - Edit Panel */}
-      <div className="w-2/3 bg-slate-900 flex flex-col">
+      <div className="w-1/4 bg-slate-900 flex flex-col">
         {selectedNode ? (
           <EditNodePanel
             node={selectedNode}
             onUpdate={handleUpdateNode}
-            onClose={() => setSelectedNode(null)}
+            onClose={() => {
+              setSelectedNode(null);
+              setBlastRadius(undefined);
+            }}
             isSaving={isSaving}
           />
         ) : (
@@ -220,12 +287,12 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
             <div>
               <h3 className="text-lg font-semibold text-slate-200 mb-2">No Node Selected</h3>
               <p className="text-slate-400 text-sm max-w-xs">
-                Click on a file or node in the tree to view and edit its annotations
+                Click on a file or node in the tree or graph to view and edit its annotations
               </p>
             </div>
             <div className="mt-4 p-4 rounded-lg bg-slate-800/50 border border-slate-700/50 max-w-xs">
               <p className="text-xs text-slate-400">
-                💡 <span className="text-slate-300">Tip:</span> Add comments, tags, and custom metadata to enhance your code understanding
+                <span className="text-slate-300">Tip:</span> Add comments, tags, and custom metadata to enhance your code understanding
               </p>
             </div>
           </div>
