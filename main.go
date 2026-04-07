@@ -16,6 +16,7 @@ import (
 	"github.com/ruffini/prism/mcp"
 	"github.com/ruffini/prism/parser"
 	"github.com/ruffini/prism/vector"
+	"github.com/ruffini/prism/watcher"
 )
 
 func main() {
@@ -50,9 +51,11 @@ func main() {
 		vectorPath := serveCmd.String("vectors", "vectors.bin", "Vector store path")
 		ollamaURL := serveCmd.String("ollama", "http://localhost:11434", "Ollama API URL")
 		embedModel := serveCmd.String("model", "nomic-embed-text", "Embedding model name")
+		repoFlag := serveCmd.String("repo", ".", "Repository path to watch (used with --watch)")
+		watchFlag := serveCmd.Bool("watch", false, "Auto-reindex files on change")
 		serveCmd.Parse(os.Args[2:])
 
-		startMCPServer(*dbPath, *vectorPath, *ollamaURL, *embedModel)
+		startMCPServer(*dbPath, *vectorPath, *ollamaURL, *embedModel, *repoFlag, *watchFlag)
 
 	case "help":
 		printUsage()
@@ -131,32 +134,17 @@ Examples:
   prism serve -db ./my-project/code_graph.db`)
 }
 
-func parseFile(filepath string, jsonOutput bool) {
-	// Detectar lenguaje
-	lang := parser.DetectLanguage(filepath)
-
-	if lang == "unknown" {
-		fmt.Printf("❌ Unsupported file type: %s\n", filepath)
+func parseFile(filePath string, jsonOutput bool) {
+	p := parser.GetParser(filePath)
+	if p == nil {
+		fmt.Printf("❌ Unsupported file type: %s\n", filePath)
 		os.Exit(1)
 	}
 
-	fmt.Printf("🔍 Parsing: %s (%s)\n", filepath, lang)
+	lang := p.Language()
+	fmt.Printf("🔍 Parsing: %s (%s)\n", filePath, lang)
 
-	var parsed interface{}
-	var err error
-
-	switch lang {
-	case "python":
-		p := parser.NewPythonParser()
-		parsed, err = p.ParseFile(filepath)
-	case "typescript", "javascript":
-		p := parser.NewTypeScriptParser()
-		parsed, err = p.ParseFile(filepath)
-	default:
-		fmt.Printf("❌ Parser not implemented for: %s\n", lang)
-		os.Exit(1)
-	}
-
+	parsed, err := p.ParseFile(filePath)
 	if err != nil {
 		fmt.Printf("❌ Parse error: %v\n", err)
 		os.Exit(1)
@@ -201,8 +189,6 @@ func indexRepository(repoPath string) {
 	// Create the code graph
 	codeGraph := graph.NewGraph(database)
 
-	pythonParser := parser.NewPythonParser()
-	tsParser := parser.NewTypeScriptParser()
 	parsedFiles := make(map[string]*parser.ParsedFile)
 	totalFiles := 0
 
@@ -223,41 +209,26 @@ func indexRepository(repoPath string) {
 			return nil
 		}
 
-		// Parse based on language
-		lang := parser.DetectLanguage(path)
+		p := parser.GetParser(path)
+		if p == nil {
+			return nil
+		}
+
 		relPath, _ := filepath.Rel(repoPath, path)
 
-		switch lang {
-		case "python":
-			parsed, err := pythonParser.ParseFile(path)
-			if err != nil {
-				fmt.Printf("  ⚠ Error parsing %s: %v\n", relPath, err)
-				return nil
-			}
-			// Store relative path in the parsed file
-			parsed.Path = relPath
-			for i := range parsed.Elements {
-				parsed.Elements[i].File = relPath
-			}
-			parsedFiles[relPath] = parsed
-			totalFiles++
-			fmt.Printf("  ✓ %s (%d elements)\n", relPath, len(parsed.Elements))
-
-		case "typescript", "javascript":
-			parsed, err := tsParser.ParseFile(path)
-			if err != nil {
-				fmt.Printf("  ⚠ Error parsing %s: %v\n", relPath, err)
-				return nil
-			}
-			// Store relative path in the parsed file
-			parsed.Path = relPath
-			for i := range parsed.Elements {
-				parsed.Elements[i].File = relPath
-			}
-			parsedFiles[relPath] = parsed
-			totalFiles++
-			fmt.Printf("  ✓ %s (%d elements)\n", relPath, len(parsed.Elements))
+		parsed, err := p.ParseFile(path)
+		if err != nil {
+			fmt.Printf("  ⚠ Error parsing %s: %v\n", relPath, err)
+			return nil
 		}
+		// Store relative path in the parsed file
+		parsed.Path = relPath
+		for i := range parsed.Elements {
+			parsed.Elements[i].File = relPath
+		}
+		parsedFiles[relPath] = parsed
+		totalFiles++
+		fmt.Printf("  ✓ %s (%d elements)\n", relPath, len(parsed.Elements))
 
 		return nil
 	})
@@ -352,7 +323,19 @@ func searchCode(query, dbPath string, topK int) {
 	}
 }
 
-func startMCPServer(dbPath, vectorPath, ollamaURL, embedModel string) {
+func indexSingleFile(g *graph.CodeGraph, filePath string) error {
+	p := parser.GetParser(filePath)
+	if p == nil {
+		return nil
+	}
+	parsed, err := p.ParseFile(filePath)
+	if err != nil {
+		return err
+	}
+	return g.BuildFromParsed(map[string]*parser.ParsedFile{filePath: parsed})
+}
+
+func startMCPServer(dbPath, vectorPath, ollamaURL, embedModel, repoPath string, watch bool) {
 	// Open database
 	database, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
@@ -393,6 +376,22 @@ func startMCPServer(dbPath, vectorPath, ollamaURL, embedModel string) {
 			fmt.Fprintf(os.Stderr, "⚠️  MCP connection closed\n")
 		}
 	}()
+
+	// Start file watcher if requested
+	if watch {
+		done := make(chan struct{})
+		go func() {
+			indexFn := func(path string) error {
+				return indexSingleFile(codeGraph, path)
+			}
+			removeFn := func(path string) error {
+				return codeGraph.RemoveFileNodes(path)
+			}
+			if err := watcher.Watch(repoPath, indexFn, removeFn, done); err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  File watcher failed: %v\n", err)
+			}
+		}()
+	}
 
 	// Keep the server running forever
 	select {}
