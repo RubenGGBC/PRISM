@@ -33,6 +33,7 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
   const [tokenStats, setTokenStats] = useState<{ tokens_served: number; tokens_saved: number } | null>(null);
+  const [blastRadius, setBlastRadius] = useState<{ level1: string[]; level2: string[] } | undefined>(undefined);
 
   const loadStats = async () => {
     try {
