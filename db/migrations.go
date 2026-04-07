@@ -22,6 +22,11 @@ func RunMigrations(db *sql.DB) error {
 		return fmt.Errorf("failed to create metadata table: %w", err)
 	}
 
+	// Create node_annotations table
+	if err := createAnnotationsTable(db); err != nil {
+		return fmt.Errorf("failed to create annotations table: %w", err)
+	}
+
 	return nil
 }
 
@@ -47,6 +52,21 @@ func createTagsTable(db *sql.DB) error {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
 		UNIQUE(node_id, tag)
+	)`
+	_, err := db.Exec(query)
+	return err
+}
+
+func createAnnotationsTable(db *sql.DB) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS node_annotations (
+		node_id     TEXT PRIMARY KEY,
+		why         TEXT,
+		status      TEXT DEFAULT 'stable',
+		entry_point BOOLEAN DEFAULT FALSE,
+		known_bug   TEXT,
+		updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 	)`
 	_, err := db.Exec(query)
 	return err

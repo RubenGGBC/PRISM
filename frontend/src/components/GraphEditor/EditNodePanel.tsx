@@ -12,6 +12,10 @@ interface NodeData {
   comments?: string;
   tags?: string[];
   custom_metadata?: Record<string, string>;
+  why?: string;
+  status?: string;
+  entry_point?: boolean;
+  known_bug?: string;
 }
 
 interface EditNodePanelProps {
@@ -34,6 +38,10 @@ export const EditNodePanel: React.FC<EditNodePanelProps> = ({
   const [metaKey, setMetaKey] = useState('');
   const [metaValue, setMetaValue] = useState('');
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [why, setWhy] = useState('');
+  const [status, setStatus] = useState('stable');
+  const [entryPoint, setEntryPoint] = useState(false);
+  const [knownBug, setKnownBug] = useState('');
 
   useEffect(() => {
     if (node) {
@@ -44,6 +52,10 @@ export const EditNodePanel: React.FC<EditNodePanelProps> = ({
       setMetaKey('');
       setMetaValue('');
       setSaveSuccess(false);
+      setWhy(node.why || '');
+      setStatus(node.status || 'stable');
+      setEntryPoint(node.entry_point || false);
+      setKnownBug(node.known_bug || '');
     }
   }, [node]);
 
@@ -54,6 +66,10 @@ export const EditNodePanel: React.FC<EditNodePanelProps> = ({
       comments,
       tags,
       custom_metadata: metadata,
+      why,
+      status,
+      entry_point: entryPoint,
+      known_bug: knownBug,
     });
 
     setSaveSuccess(true);
@@ -137,6 +153,60 @@ export const EditNodePanel: React.FC<EditNodePanelProps> = ({
             onChange={(e) => setComments(e.target.value)}
             placeholder="Add your notes about this function..."
             className="w-full h-24 px-4 py-3 bg-slate-800/50 border border-slate-700 text-slate-100 placeholder-slate-500 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 text-sm transition resize-none"
+          />
+        </div>
+
+        {/* Why does this exist */}
+        <div className="space-y-2">
+          <label className="flex items-center gap-2 text-xs font-semibold text-slate-300 uppercase tracking-wide">
+            <span className="text-emerald-400">?</span>
+            Por qué existe
+          </label>
+          <textarea
+            value={why}
+            onChange={(e) => setWhy(e.target.value)}
+            placeholder="Contexto de negocio: por qué existe esta función..."
+            className="w-full h-20 px-4 py-3 bg-slate-800/50 border border-slate-700 text-slate-100 placeholder-slate-500 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 text-sm transition resize-none"
+          />
+        </div>
+
+        {/* Status */}
+        <div className="space-y-2">
+          <label className="text-xs font-semibold text-slate-300 uppercase tracking-wide">Estado</label>
+          <select
+            value={status}
+            onChange={(e) => setStatus(e.target.value)}
+            className="w-full px-3 py-2 bg-slate-800/50 border border-slate-700 text-slate-100 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-500 text-sm"
+          >
+            <option value="stable">Stable</option>
+            <option value="legacy">Legacy</option>
+            <option value="deprecated">Deprecated</option>
+            <option value="critical">Critical</option>
+          </select>
+        </div>
+
+        {/* Entry point toggle */}
+        <div className="flex items-center justify-between py-2">
+          <label className="text-xs font-semibold text-slate-300 uppercase tracking-wide">Entry Point</label>
+          <button
+            onClick={() => setEntryPoint(!entryPoint)}
+            className={`relative w-10 h-5 rounded-full transition ${entryPoint ? 'bg-emerald-500' : 'bg-slate-600'}`}
+          >
+            <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${entryPoint ? 'translate-x-5' : ''}`} />
+          </button>
+        </div>
+
+        {/* Known bug */}
+        <div className="space-y-2">
+          <label className="flex items-center gap-2 text-xs font-semibold text-slate-300 uppercase tracking-wide">
+            <span className="text-red-400">⚠</span>
+            Bug conocido
+          </label>
+          <textarea
+            value={knownBug}
+            onChange={(e) => setKnownBug(e.target.value)}
+            placeholder="Describe bugs conocidos que Claude debe tener en cuenta..."
+            className="w-full h-20 px-4 py-3 bg-slate-800/50 border border-slate-700/50 border-red-900/30 text-slate-100 placeholder-slate-500 rounded-lg focus:outline-none focus:ring-1 focus:ring-red-500 text-sm transition resize-none"
           />
         </div>
 

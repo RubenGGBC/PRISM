@@ -14,6 +14,10 @@ type UpdateNodeRequest struct {
 	Comments       string            `json:"comments"`
 	Tags           []string          `json:"tags"`
 	CustomMetadata map[string]string `json:"custom_metadata"`
+	Why            string            `json:"why"`
+	Status         string            `json:"status"`
+	EntryPoint     bool              `json:"entry_point"`
+	KnownBug       string            `json:"known_bug"`
 }
 
 // NodeFullResponse includes node data with annotations
@@ -74,6 +78,13 @@ func (a *APIServer) HandleUpdateNode(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	}
+
+	// Update structured annotations
+	if err := a.graph.UpsertAnnotations(nodeID, req.Why, req.Status, req.KnownBug, req.EntryPoint); err != nil {
+		log.Printf("❌ Failed to update annotations: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to update annotations: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	log.Printf("✅ Updated node: %s", nodeID)
