@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { TreeNode } from './TreeNode';
 import { EditNodePanel } from './EditNodePanel';
 import { GraphViz } from '../GraphViz';
+import { Profiles } from '../Profiles';
 import { Search, AlertCircle, FileText, Loader } from 'lucide-react';
 
 interface TreeNodeData {
@@ -31,9 +32,21 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
+  const [tokenStats, setTokenStats] = useState<{ tokens_served: number; tokens_saved: number } | null>(null);
+
+  const loadStats = async () => {
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/stats`);
+      const data = await res.json();
+      setTokenStats(data);
+    } catch {}
+  };
 
   useEffect(() => {
     loadFiles();
+    loadStats();
+    const interval = setInterval(loadStats, 30000);
+    return () => clearInterval(interval);
   }, []);
 
   const loadFiles = async () => {
@@ -246,6 +259,12 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
           )}
         </div>
 
+        {/* Profiles section */}
+        <Profiles
+          apiBaseUrl={apiBaseUrl}
+          selectedNodeId={selectedNode?.id}
+        />
+
         {/* Footer Stats */}
         <div className="border-t border-slate-700/50 px-4 py-3 text-xs text-slate-500 bg-slate-950/50">
           <p>{filteredTree.length} files • {treeData.length} total</p>
@@ -253,16 +272,30 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
       </div>
 
       {/* Center - Graph Visualization */}
-      <div className="flex-1 bg-slate-900 overflow-hidden">
-        <GraphViz
-          nodes={graphNodes}
-          edges={graphEdges}
-          onNodeClick={(nodeId) => {
-            const flat = treeData.flatMap((f) => [f, ...(f.children || [])]);
-            const found = flat.find((n) => n.id === nodeId);
-            if (found) handleSelectNode(found);
-          }}
-        />
+      <div className="flex-1 bg-slate-900 overflow-hidden flex flex-col">
+        {tokenStats && tokenStats.tokens_saved > 0 && (
+          <div className="bg-slate-800/50 border-b border-slate-700/50 px-4 py-2 text-xs text-slate-400 flex items-center gap-3 shrink-0">
+            <span className="text-emerald-400 font-semibold">PRISM</span>
+            <span>{tokenStats.tokens_served.toLocaleString()} tokens servidos</span>
+            <span className="text-slate-600">vs</span>
+            <span>{(tokenStats.tokens_served + tokenStats.tokens_saved).toLocaleString()} sin PRISM</span>
+            <span className="ml-auto text-emerald-400 font-medium">
+              {Math.round((tokenStats.tokens_saved / (tokenStats.tokens_served + tokenStats.tokens_saved)) * 100)}% ahorro
+            </span>
+          </div>
+        )}
+        <div className="flex-1 overflow-hidden">
+          <GraphViz
+            nodes={graphNodes}
+            edges={graphEdges}
+            highlightIds={blastRadius}
+            onNodeClick={(nodeId) => {
+              const flat = treeData.flatMap((f) => [f, ...(f.children || [])]);
+              const found = flat.find((n) => n.id === nodeId);
+              if (found) handleSelectNode(found);
+            }}
+          />
+        </div>
       </div>
 
       {/* Right Panel - Edit Panel (only when node selected) */}
@@ -271,7 +304,10 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
           <EditNodePanel
             node={selectedNode}
             onUpdate={handleUpdateNode}
-            onClose={() => setSelectedNode(null)}
+            onClose={() => {
+              setSelectedNode(null);
+              setBlastRadius(undefined);
+            }}
             isSaving={isSaving}
           />
         </div>

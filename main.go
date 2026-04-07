@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/ruffini/prism/api"
@@ -56,6 +57,13 @@ func main() {
 		serveCmd.Parse(os.Args[2:])
 
 		startMCPServer(*dbPath, *vectorPath, *ollamaURL, *embedModel, *repoFlag, *watchFlag)
+
+	case "export":
+		exportCmd := flag.NewFlagSet("export", flag.ExitOnError)
+		dbPath := exportCmd.String("db", "code_graph.db", "Database path")
+		output := exportCmd.String("output", "CLAUDE.md", "Output file path")
+		exportCmd.Parse(os.Args[2:])
+		exportClaudeMD(*dbPath, *output)
 
 	case "help":
 		printUsage()
@@ -123,6 +131,12 @@ Options for 'serve':
   -db <path>          Path to code_graph.db (default: code_graph.db)
   -ollama <url>       Ollama API URL (default: http://localhost:11434)
   -model <name>       Embedding model (default: nomic-embed-text)
+
+  export               Generate CLAUDE.md from graph annotations
+
+Options for 'export':
+  -db <path>          Database path (default: code_graph.db)
+  -output <path>      Output file (default: CLAUDE.md)
 
 Examples:
   prism parse main.py
@@ -525,4 +539,100 @@ func generateEmbeddings(dbPath, ollamaURL, model string) {
 	if failed > 0 {
 		fmt.Printf("   Failed: %d\n", failed)
 	}
+}
+
+func exportClaudeMD(dbPath, outputPath string) {
+	database, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		fmt.Printf("❌ Failed to open database: %v\n", err)
+		os.Exit(1)
+	}
+	defer database.Close()
+
+	var sb strings.Builder
+	sb.WriteString("# CLAUDE.md — Generado por PRISM\n\n")
+	sb.WriteString("> Este archivo fue generado automáticamente desde las anotaciones del grafo de código.\n\n")
+
+	// Nodes with comments
+	rows, err := database.Query(`
+		SELECT n.name, n.file, n.line, nc.comment
+		FROM nodes n
+		JOIN node_comments nc ON nc.node_id = n.id
+		WHERE nc.comment IS NOT NULL AND nc.comment != ''
+		ORDER BY n.file, n.line
+	`)
+	if err == nil {
+		defer rows.Close()
+		sb.WriteString("## Nodos Anotados\n\n")
+		for rows.Next() {
+			var name, file, comment string
+			var line int
+			rows.Scan(&name, &file, &line, &comment)
+			sb.WriteString(fmt.Sprintf("- **%s** (`%s:%d`) — %s\n", name, file, line, comment))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Nodes with tags
+	rows2, err2 := database.Query(`
+		SELECT n.name, n.file, n.line, GROUP_CONCAT(nt.tag, ', ') as tags
+		FROM nodes n
+		JOIN node_tags nt ON nt.node_id = n.id
+		GROUP BY n.id, n.name, n.file, n.line
+		ORDER BY n.file, n.line
+	`)
+	if err2 == nil {
+		defer rows2.Close()
+		sb.WriteString("## Nodos con Etiquetas\n\n")
+		for rows2.Next() {
+			var name, file, tags string
+			var line int
+			rows2.Scan(&name, &file, &line, &tags)
+			sb.WriteString(fmt.Sprintf("- **%s** (`%s:%d`) [%s]\n", name, file, line, tags))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Nodes with metadata
+	rows3, err3 := database.Query(`
+		SELECT n.name, n.file, n.line, nm.key, nm.value
+		FROM nodes n
+		JOIN node_metadata nm ON nm.node_id = n.id
+		ORDER BY n.file, n.line, nm.key
+	`)
+	if err3 == nil {
+		defer rows3.Close()
+		sb.WriteString("## Metadata de Nodos\n\n")
+		for rows3.Next() {
+			var name, file, key, value string
+			var line int
+			rows3.Scan(&name, &file, &line, &key, &value)
+			sb.WriteString(fmt.Sprintf("- **%s** (`%s:%d`) %s: %s\n", name, file, line, key, value))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Context profiles
+	rows4, err4 := database.Query(`SELECT name, description FROM profiles ORDER BY name`)
+	if err4 == nil {
+		defer rows4.Close()
+		sb.WriteString("## Perfiles de Contexto PRISM\n\n")
+		sb.WriteString("Usa `use_profile` en Claude Code para cargar el contexto de un área:\n\n")
+		for rows4.Next() {
+			var name, desc string
+			rows4.Scan(&name, &desc)
+			sb.WriteString(fmt.Sprintf("- `%s`", name))
+			if desc != "" {
+				sb.WriteString(fmt.Sprintf(" — %s", desc))
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+
+	if err := os.WriteFile(outputPath, []byte(sb.String()), 0644); err != nil {
+		fmt.Printf("❌ Failed to write %s: %v\n", outputPath, err)
+		os.Exit(1)
+	}
+	fmt.Printf("✅ Exported to %s\n", outputPath)
 }
