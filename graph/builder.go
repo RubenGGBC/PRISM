@@ -61,6 +61,12 @@ func (g *CodeGraph) AddEdge(source, target, edgeType string) error {
 	return err
 }
 
+// RemoveFileNodes removes all nodes associated with a file from the graph
+func (g *CodeGraph) RemoveFileNodes(filePath string) error {
+	_, err := g.DB.Exec(`DELETE FROM nodes WHERE file = ?`, filePath)
+	return err
+}
+
 // BuildFromParsed builds the graph from parsed files
 func (g *CodeGraph) BuildFromParsed(files map[string]*parser.ParsedFile) error {
 	// Start a transaction for better performance

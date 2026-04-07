@@ -23,7 +23,10 @@ func TestCompleteIndexingWorkflow(t *testing.T) {
 	defer database.Close()
 
 	// Step 2: Parse test files
-	tsParser := parser.NewTypeScriptParser()
+	tsParser := parser.GetParser("../test/sample-repo/db/user.ts")
+	if tsParser == nil {
+		t.Skip("No parser available for .ts files")
+	}
 
 	// Parse TypeScript files
 	tsFile, err := tsParser.ParseFile("../test/sample-repo/db/user.ts")

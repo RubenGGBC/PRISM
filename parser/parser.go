@@ -3,45 +3,39 @@ package parser
 import (
 	"path/filepath"
 	"strings"
-
-	"github.com/ruffini/prism/internal/models"
 )
 
 // Parser interface para diferentes lenguajes
 type Parser interface {
-	Parse(source []byte, filename string) (*models.ParsedFile, error)
+	Parse(source []byte, filename string) (*ParsedFile, error)
+	ParseFile(filename string) (*ParsedFile, error)
 	Language() string
 	Extensions() []string
+}
+
+// GetParser devuelve el parser adecuado para un archivo, o nil si no se soporta
+func GetParser(filename string) Parser {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if config, ok := languageRegistry[ext]; ok {
+		return NewTreeSitterParser(config)
+	}
+	return nil
 }
 
 // DetectLanguage detecta el lenguaje basándose en la extensión del archivo
 func DetectLanguage(filename string) string {
 	ext := strings.ToLower(filepath.Ext(filename))
-	switch ext {
-	case ".py":
-		return "python"
-	case ".ts", ".tsx":
-		return "typescript"
-	case ".js", ".jsx":
-		return "javascript"
-	case ".go":
-		return "go"
-	default:
-		return "unknown"
+	if config, ok := languageRegistry[ext]; ok {
+		return config.Name
 	}
+	return "unknown"
 }
 
 // IsCodeFile verifica si el archivo es código parseable
 func IsCodeFile(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
-	validExts := map[string]bool{
-		".py":  true,
-		".ts":  true,
-		".tsx": true,
-		".js":  true,
-		".jsx": true,
-	}
-	return validExts[ext]
+	_, ok := languageRegistry[ext]
+	return ok
 }
 
 // ShouldSkipPath verifica si debemos saltar este path

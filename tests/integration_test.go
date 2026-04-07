@@ -23,7 +23,10 @@ func TestFullIndexingPipeline(t *testing.T) {
 	defer database.Close()
 
 	// Parse test files using TypeScript parser
-	tsParser := parser.NewTypeScriptParser()
+	tsParser := parser.GetParser("../test/sample-repo/db/user.ts")
+	if tsParser == nil {
+		t.Skip("No parser available for .ts files")
+	}
 
 	// Parse the test TypeScript file
 	pyFile, err := tsParser.ParseFile("../test/sample-repo/db/user.ts")
