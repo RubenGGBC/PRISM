@@ -130,5 +130,47 @@ func (g *CodeGraph) GetNodeWithAnnotations(nodeID string) (*models.GraphNode, ma
 	}
 	node.UpdatedAt = time.Now().Format(time.RFC3339)
 
+	// Populate structured annotation fields
+	why, status, knownBug, entryPoint, err := g.GetAnnotations(nodeID)
+	if err == nil {
+		node.Why = why
+		node.Status = status
+		node.KnownBug = knownBug
+		node.EntryPoint = entryPoint
+	}
+
 	return node, annotations, nil
+}
+
+// UpsertAnnotations saves the structured annotations of a node
+func (g *CodeGraph) UpsertAnnotations(nodeID, why, status, knownBug string, entryPoint bool) error {
+	query := `
+	INSERT INTO node_annotations (node_id, why, status, entry_point, known_bug, updated_at)
+	VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(node_id) DO UPDATE SET
+		why = excluded.why,
+		status = excluded.status,
+		entry_point = excluded.entry_point,
+		known_bug = excluded.known_bug,
+		updated_at = CURRENT_TIMESTAMP
+	`
+	_, err := g.DB.Exec(query, nodeID, why, status, entryPoint, knownBug)
+	return err
+}
+
+// GetAnnotations returns the structured annotations of a node
+func (g *CodeGraph) GetAnnotations(nodeID string) (why, status, knownBug string, entryPoint bool, err error) {
+	row := g.DB.QueryRow(
+		`SELECT why, status, entry_point, known_bug FROM node_annotations WHERE node_id = ?`,
+		nodeID,
+	)
+	var w, s, kb sql.NullString
+	var ep sql.NullBool
+	if err = row.Scan(&w, &s, &ep, &kb); err != nil {
+		if err == sql.ErrNoRows {
+			return "", "stable", "", false, nil
+		}
+		return
+	}
+	return w.String, s.String, kb.String, ep.Bool, nil
 }

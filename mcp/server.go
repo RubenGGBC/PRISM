@@ -537,31 +537,9 @@ func (m *MCPServer) formatVectorResults(results []vector.SearchResult, nodesWith
 			continue
 		}
 
-		output += fmt.Sprintf("### %d. %s (similarity: %.2f%%)\n", i+1, node.Name, r.Similarity*100)
-		output += fmt.Sprintf("**File:** %s:%d\n", node.File, node.Line)
-		output += fmt.Sprintf("**Type:** %s\n\n", node.Type)
-
-		if node.Signature != "" {
-			output += fmt.Sprintf("```\n%s\n```\n\n", node.Signature)
-		}
-
-		// Add annotations if they exist
-		if len(node.Comments) > 0 || len(node.Tags) > 0 || len(node.CustomMetadata) > 0 {
-			output += "**User Annotations:**\n"
-			if node.Comments != "" {
-				output += fmt.Sprintf("- **Comment:** %s\n", node.Comments)
-			}
-			if len(node.Tags) > 0 {
-				output += fmt.Sprintf("- **Tags:** %v\n", node.Tags)
-			}
-			if len(node.CustomMetadata) > 0 {
-				output += "- **Metadata:**\n"
-				for key, value := range node.CustomMetadata {
-					output += fmt.Sprintf("  - %s: %s\n", key, value)
-				}
-			}
-			output += "\n"
-		}
+		output += fmt.Sprintf("### %d. (similarity: %.2f%%)\n", i+1, r.Similarity*100)
+		output += m.formatNodeWithAnnotations(node.ID, node.Name, node.Type, node.File, node.Line, node.Signature, "")
+		output += "\n"
 	}
 
 	return mcp.NewToolResultText(output)
@@ -783,6 +761,46 @@ func discoverDefaultMdFiles() []string {
 	}
 
 	return files
+}
+
+// formatNodeWithAnnotations formats a node including its human annotations
+func (m *MCPServer) formatNodeWithAnnotations(nodeID, name, nodeType, file string, line int, signature, docstring string) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## %s (%s:%d)\n", name, file, line))
+	sb.WriteString(fmt.Sprintf("Type: %s\n", nodeType))
+
+	// Load structured annotations
+	why, status, knownBug, entryPoint, err := m.graph.GetAnnotations(nodeID)
+	if err == nil {
+		if status != "" && status != "stable" {
+			sb.WriteString(fmt.Sprintf("Status: %s\n", status))
+		}
+		if entryPoint {
+			sb.WriteString("Entry point: YES\n")
+		}
+		if why != "" {
+			sb.WriteString(fmt.Sprintf("Why: %s\n", why))
+		}
+		if knownBug != "" {
+			sb.WriteString(fmt.Sprintf("Known bug: %s\n", knownBug))
+		}
+	}
+
+	// Load user comments
+	var comment string
+	row := m.graph.DB.QueryRow(`SELECT comment FROM node_comments WHERE node_id = ?`, nodeID)
+	row.Scan(&comment)
+	if comment != "" {
+		sb.WriteString(fmt.Sprintf("Notes: %s\n", comment))
+	}
+
+	if signature != "" {
+		sb.WriteString(fmt.Sprintf("Signature: %s\n", signature))
+	}
+	if docstring != "" {
+		sb.WriteString(fmt.Sprintf("Docs: %s\n", docstring))
+	}
+	return sb.String()
 }
 
 // formatNodesResult formats a list of nodes

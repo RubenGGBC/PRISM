@@ -53,6 +53,11 @@ type GraphNode struct {
 	UpdatedAt      string            `json:"updated_at,omitempty"`   // Last annotation update
 	PageRank       float64           `json:"pagerank"`
 	BlastRadius    int               `json:"blast_radius"`
+	// Structured annotations
+	Why        string `json:"why,omitempty"`
+	Status     string `json:"status,omitempty"`
+	EntryPoint bool   `json:"entry_point,omitempty"`
+	KnownBug   string `json:"known_bug,omitempty"`
 }
 
 // AnnotationUpdate is sent by frontend to update node annotations
@@ -60,6 +65,10 @@ type AnnotationUpdate struct {
 	Comments       string            `json:"comments"`
 	Tags           []string          `json:"tags"`
 	CustomMetadata map[string]string `json:"custom_metadata"`
+	Why            string            `json:"why"`
+	Status         string            `json:"status"`
+	EntryPoint     bool              `json:"entry_point"`
+	KnownBug       string            `json:"known_bug"`
 }
 
 // GraphEdge representa una conexión entre nodos
