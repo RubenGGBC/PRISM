@@ -31,12 +31,9 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
-  const [callEdges, setCallEdges] = useState<{ source: string; target: string; type: 'calls' }[]>([]);
-  const [blastRadius, setBlastRadius] = useState<{ level1: string[]; level2: string[] } | undefined>();
 
   useEffect(() => {
     loadFiles();
-    loadCallEdges();
   }, []);
 
   const loadFiles = async () => {
@@ -57,22 +54,44 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
 
       setTreeData(files);
       setError(null);
+
+      // Auto-load all file nodes so the graph shows connections from the start
+      await Promise.all(
+        (data.files || []).map((file: string) =>
+          fetch(`${apiBaseUrl}/api/file/nodes?file=${encodeURIComponent(file)}`)
+            .then((r) => r.json())
+            .then((d) => {
+              const nodes = d.nodes || [];
+              setTreeData((prev) =>
+                prev.map((f) =>
+                  f.id === file
+                    ? {
+                        ...f,
+                        children: nodes.map((node: any) => ({
+                          id: node.id,
+                          name: node.name,
+                          type: node.type,
+                          file: node.file,
+                          line: node.line,
+                          signature: node.signature,
+                          comments: node.comments,
+                          tags: node.tags,
+                          custom_metadata: node.custom_metadata,
+                          children: [],
+                        })),
+                      }
+                    : f
+                )
+              );
+            })
+            .catch(() => {/* silently ignore per-file errors */})
+        )
+      );
     } catch (err) {
       setError(`Error loading files: ${err}`);
       console.error(err);
     } finally {
       setIsLoading(false);
-    }
-  };
-
-  const loadCallEdges = async () => {
-    try {
-      const response = await fetch(`${apiBaseUrl}/api/graph/edges`);
-      if (!response.ok) return;
-      const data = await response.json();
-      setCallEdges((data.edges || []).map((e: any) => ({ ...e, type: 'calls' as const })));
-    } catch {
-      // silently ignore
     }
   };
 
@@ -115,29 +134,16 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
 
   const handleSelectNode = async (node: TreeNodeData) => {
     try {
-      const [nodeRes, impactRes] = await Promise.all([
-        fetch(`${apiBaseUrl}/api/node/full?id=${encodeURIComponent(node.id)}`),
-        fetch(`${apiBaseUrl}/api/node/impact?id=${encodeURIComponent(node.id)}`),
-      ]);
+      const response = await fetch(
+        `${apiBaseUrl}/api/node/full?id=${encodeURIComponent(node.id)}`
+      );
+      if (!response.ok) throw new Error('Failed to load node');
 
-      if (nodeRes.ok) {
-        const data = await nodeRes.json();
-        setSelectedNode(data.node);
-      } else {
-        setSelectedNode(node);
-      }
-
-      if (impactRes.ok) {
-        const impact = await impactRes.json();
-        if (impact.level1?.length > 0 || impact.level2?.length > 0) {
-          setBlastRadius({ level1: impact.level1 || [], level2: impact.level2 || [] });
-        } else {
-          setBlastRadius(undefined);
-        }
-      }
+      const data = await response.json();
+      setSelectedNode(data.node);
     } catch (err) {
+      console.error('Error loading node:', err);
       setSelectedNode(node);
-      setBlastRadius(undefined);
     }
   };
 
@@ -170,32 +176,25 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
     node.file.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  const graphNodes = useMemo(() => {
-    return treeData.flatMap((file) => [
+  const graphNodes = useMemo(() =>
+    treeData.flatMap((file) => [
       { id: file.id, name: file.name, type: file.type },
-      ...(file.children || []).map((child) => ({
-        id: child.id,
-        name: child.name,
-        type: child.type,
-      })),
-    ]);
-  }, [treeData]);
+      ...(file.children || []).map((child) => ({ id: child.id, name: child.name, type: child.type })),
+    ]),
+    [treeData]
+  );
 
-  const graphEdges = useMemo(() => {
-    const containsEdges = treeData.flatMap((file) =>
-      (file.children || []).map((child) => ({
-        source: file.id,
-        target: child.id,
-        type: 'contains' as const,
-      }))
-    );
-    return [...containsEdges, ...callEdges];
-  }, [treeData, callEdges]);
+  const graphEdges = useMemo(() =>
+    treeData.flatMap((file) =>
+      (file.children || []).map((child) => ({ source: file.id, target: child.id }))
+    ),
+    [treeData]
+  );
 
   return (
     <div className="flex h-full bg-slate-900">
       {/* Left Sidebar - Tree */}
-      <div className="w-1/4 border-r border-slate-700/50 flex flex-col bg-slate-950 backdrop-blur-sm">
+      <div className="w-64 shrink-0 border-r border-slate-700/50 flex flex-col bg-slate-950 backdrop-blur-sm">
         {/* Search Bar */}
         <div className="p-4 border-b border-slate-700/50 bg-slate-950/50">
           <div className="relative group">
@@ -254,11 +253,10 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
       </div>
 
       {/* Center - Graph Visualization */}
-      <div className="flex-1 border-r border-slate-700/50">
+      <div className="flex-1 bg-slate-900 overflow-hidden">
         <GraphViz
           nodes={graphNodes}
           edges={graphEdges}
-          highlightIds={blastRadius}
           onNodeClick={(nodeId) => {
             const flat = treeData.flatMap((f) => [f, ...(f.children || [])]);
             const found = flat.find((n) => n.id === nodeId);
@@ -267,37 +265,17 @@ export const CodeTreeView: React.FC<CodeTreeViewProps> = ({
         />
       </div>
 
-      {/* Right Sidebar - Edit Panel */}
-      <div className="w-1/4 bg-slate-900 flex flex-col">
-        {selectedNode ? (
+      {/* Right Panel - Edit Panel (only when node selected) */}
+      {selectedNode && (
+        <div className="w-80 shrink-0 border-l border-slate-700/50 bg-slate-900 flex flex-col">
           <EditNodePanel
             node={selectedNode}
             onUpdate={handleUpdateNode}
-            onClose={() => {
-              setSelectedNode(null);
-              setBlastRadius(undefined);
-            }}
+            onClose={() => setSelectedNode(null)}
             isSaving={isSaving}
           />
-        ) : (
-          <div className="h-full flex items-center justify-center flex-col gap-6 px-8 text-center">
-            <div className="p-4 rounded-full bg-emerald-500/10 border border-emerald-500/20">
-              <FileText size={32} className="text-emerald-400" />
-            </div>
-            <div>
-              <h3 className="text-lg font-semibold text-slate-200 mb-2">No Node Selected</h3>
-              <p className="text-slate-400 text-sm max-w-xs">
-                Click on a file or node in the tree or graph to view and edit its annotations
-              </p>
-            </div>
-            <div className="mt-4 p-4 rounded-lg bg-slate-800/50 border border-slate-700/50 max-w-xs">
-              <p className="text-xs text-slate-400">
-                <span className="text-slate-300">Tip:</span> Add comments, tags, and custom metadata to enhance your code understanding
-              </p>
-            </div>
-          </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 };

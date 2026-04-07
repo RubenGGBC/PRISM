@@ -1,12 +1,12 @@
-# Plan 1: Multi-language Parser + File Watcher
+# Plan 1: Multi-language Parser (Generic Interface) + File Watcher
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Añadir soporte para Go, Rust y Java al indexador, y reindexado automático cuando cambian archivos.
+**Goal:** Reemplazar los parsers específicos por idioma con una única interfaz genérica tree-sitter configurable. Añadir soporte para Go, Rust, Java (y mantener Python/TypeScript). Añadir reindexado automático con file watcher.
 
-**Architecture:** Se añaden tres nuevos parsers siguiendo el patrón existente (tree-sitter). Se actualiza `DetectLanguage`/`IsCodeFile` en `parser/parser.go` y el `indexRepository` en `main.go`. El file watcher vive en `watcher/watcher.go` y se activa con `prism serve --watch`.
+**Architecture:** Un único `parser/treesitter.go` define `TreeSitterParser` que toma un `LanguageConfig` — una struct de configuración con el lenguaje tree-sitter, extensiones, y los nombres de nodos AST que representan funciones/clases/imports. `parser/languages.go` registra todos los lenguajes. `parser/parser.go` expone `GetParser(filename)` que consulta el registro. El file watcher vive en `watcher/watcher.go` y se activa con `prism serve --watch`.
 
-**Tech Stack:** Go, tree-sitter (go-tree-sitter), tree-sitter-go/rust/java grammars, fsnotify
+**Tech Stack:** Go, tree-sitter (go-tree-sitter), fsnotify
 
 ---
 
@@ -15,29 +15,28 @@
 | Acción | Archivo |
 |--------|---------|
 | Modify | `go.mod` |
-| Create | `parser/go_parser.go` |
-| Create | `parser/rust_parser.go` |
-| Create | `parser/java_parser.go` |
+| Create | `parser/treesitter.go` |
+| Create | `parser/languages.go` |
 | Modify | `parser/parser.go` |
+| Delete | `parser/python.go` (migrar a config en languages.go) |
+| Delete | `parser/typescript.go` (migrar a config en languages.go) |
 | Create | `watcher/watcher.go` |
-| Modify | `graph/builder.go` |
 | Modify | `main.go` |
 | Create | `tests/parser_test.go` |
 
 ---
 
-### Task 1: Añadir dependencias de lenguajes
+### Task 1: Añadir dependencias
 
 **Files:**
 - Modify: `go.mod`
 
-- [ ] **Step 1: Añadir grammars al go.mod**
+- [ ] **Step 1: Añadir grammars y fsnotify**
 
-Ejecutar en el directorio raíz:
 ```bash
-go get github.com/tree-sitter/tree-sitter-go@latest
-go get github.com/tree-sitter/tree-sitter-rust@latest
-go get github.com/tree-sitter/tree-sitter-java@latest
+go get github.com/tree-sitter/tree-sitter-go/bindings/go@latest
+go get github.com/tree-sitter/tree-sitter-rust/bindings/go@latest
+go get github.com/tree-sitter/tree-sitter-java/bindings/go@latest
 go get github.com/fsnotify/fsnotify@latest
 go mod tidy
 ```
@@ -48,7 +47,7 @@ go mod tidy
 go build ./...
 ```
 
-Expected: sin errores de compilación.
+Expected: sin errores (aún sin usar los imports, puede que haya warning de unused — está bien por ahora).
 
 - [ ] **Step 3: Commit**
 
@@ -59,13 +58,684 @@ git commit -m "feat: add tree-sitter grammars for Go, Rust, Java and fsnotify"
 
 ---
 
-### Task 2: Parser de Go
+### Task 2: Parser genérico tree-sitter
 
 **Files:**
-- Create: `parser/go_parser.go`
-- Test: `tests/parser_test.go`
+- Create: `parser/treesitter.go`
 
-- [ ] **Step 1: Escribir el test que falla**
+Este parser implementa la interfaz `Parser` existente usando una `LanguageConfig` que describe los tipos de nodos AST relevantes por lenguaje. No hay código específico por idioma aquí — solo el mecanismo genérico.
+
+- [ ] **Step 1: Crear `parser/treesitter.go`**
+
+```go
+package parser
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	sitter "github.com/tree-sitter/go-tree-sitter"
+)
+
+// NodeKindConfig describe cómo extraer un tipo de elemento del AST
+type NodeKindConfig struct {
+	Kind          string // tipo de nodo AST (e.g. "function_declaration")
+	NameField     string // campo del nodo que contiene el nombre (e.g. "name")
+	ElementType   string // tipo semántico resultante: "function", "method", "class", "struct", "interface"
+	ReceiverField string // campo del receptor para métodos con receiver (Go: "receiver"), vacío si no aplica
+	ParentKind    string // tipo del nodo padre que indica que es un método (e.g. "impl_item" en Rust), vacío si no aplica
+	BodyField     string // campo del body para extraer signature sin body (e.g. "body")
+}
+
+// ImportKindConfig describe cómo encontrar imports en el AST
+type ImportKindConfig struct {
+	Kind       string // tipo de nodo (e.g. "import_declaration")
+	PathField  string // campo con el path del módulo
+	AliasField string // campo con el alias, vacío si no existe
+}
+
+// LanguageConfig configura el parser genérico para un lenguaje
+type LanguageConfig struct {
+	Name        string
+	Extensions  []string
+	Language    *sitter.Language
+	NodeKinds   []NodeKindConfig
+	ImportKinds []ImportKindConfig
+	DocComment  string // "prev_sibling" (Go/Rust) o "first_child_string" (Python/JS docstrings)
+}
+
+// TreeSitterParser implementa Parser para cualquier lenguaje configurado via LanguageConfig
+type TreeSitterParser struct {
+	config LanguageConfig
+}
+
+// NewTreeSitterParser crea un parser para el lenguaje dado
+func NewTreeSitterParser(config LanguageConfig) *TreeSitterParser {
+	return &TreeSitterParser{config: config}
+}
+
+func (p *TreeSitterParser) Language() string    { return p.config.Name }
+func (p *TreeSitterParser) Extensions() []string { return p.config.Extensions }
+
+func (p *TreeSitterParser) ParseFile(fp string) (*ParsedFile, error) {
+	source, err := os.ReadFile(fp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+	return p.Parse(source, fp)
+}
+
+func (p *TreeSitterParser) Parse(source []byte, filename string) (*ParsedFile, error) {
+	start := time.Now()
+
+	par := sitter.NewParser()
+	defer par.Close()
+
+	if err := par.SetLanguage(p.config.Language); err != nil {
+		return nil, fmt.Errorf("failed to set language: %w", err)
+	}
+
+	tree := par.Parse(source, nil)
+	defer tree.Close()
+
+	parsed := &ParsedFile{
+		Path:     filename,
+		Language: p.config.Name,
+		Elements: []CodeElement{},
+		Imports:  []Import{},
+	}
+
+	root := tree.RootNode()
+	parsed.Imports = p.extractImports(root, source)
+	p.walkNode(root, source, filename, parsed, "")
+	parsed.ParseTime = time.Since(start).Milliseconds()
+	return parsed, nil
+}
+
+func (p *TreeSitterParser) walkNode(node *sitter.Node, source []byte, filename string, parsed *ParsedFile, implType string) {
+	kind := node.Kind()
+
+	// Detectar contexto de impl/class que da nombre a métodos hijos
+	currentImpl := implType
+	for _, nc := range p.config.NodeKinds {
+		if nc.ParentKind != "" && kind == nc.ParentKind {
+			// Extraer el nombre del tipo contenedor (e.g. el tipo en "impl Foo {")
+			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+				currentImpl = string(source[nameNode.StartByte():nameNode.EndByte()])
+			} else if nameNode := node.ChildByFieldName("type"); nameNode != nil {
+				currentImpl = strings.TrimPrefix(
+					strings.TrimSpace(string(source[nameNode.StartByte():nameNode.EndByte()])),
+					"*",
+				)
+			}
+		}
+	}
+
+	// Intentar extraer elemento según los NodeKinds configurados
+	for _, nc := range p.config.NodeKinds {
+		if kind != nc.Kind {
+			continue
+		}
+		elem := p.extractElement(node, source, filename, nc, currentImpl)
+		if elem != nil {
+			parsed.Elements = append(parsed.Elements, *elem)
+		}
+		// No recursar dentro del cuerpo de funciones (evita funciones anidadas duplicadas)
+		return
+	}
+
+	// Recursar
+	count := int(node.ChildCount())
+	for i := 0; i < count; i++ {
+		if child := node.Child(uint(i)); child != nil {
+			p.walkNode(child, source, filename, parsed, currentImpl)
+		}
+	}
+}
+
+func (p *TreeSitterParser) extractElement(node *sitter.Node, source []byte, filename string, nc NodeKindConfig, implType string) *CodeElement {
+	// Obtener nombre
+	var name string
+	if nc.NameField != "" {
+		if nameNode := node.ChildByFieldName(nc.NameField); nameNode != nil {
+			name = string(source[nameNode.StartByte():nameNode.EndByte()])
+		}
+	}
+	if name == "" {
+		return nil
+	}
+
+	// Obtener receiver para métodos con receiver explícito (Go)
+	if nc.ReceiverField != "" {
+		if recvNode := node.ChildByFieldName(nc.ReceiverField); recvNode != nil {
+			recvText := string(source[recvNode.StartByte():recvNode.EndByte()])
+			recvText = strings.Trim(recvText, "()")
+			parts := strings.Fields(recvText)
+			for _, part := range parts {
+				clean := strings.Trim(part, "*[]")
+				if clean != "" && !strings.ContainsAny(clean, "()") {
+					implType = clean
+					break
+				}
+			}
+		}
+	}
+
+	fullName := name
+	if implType != "" && nc.ElementType == "method" {
+		fullName = implType + "." + name
+	}
+
+	id := fmt.Sprintf("%s:%s", filename, fullName)
+
+	// Signature (hasta el body)
+	sig := p.extractSignature(node, source, nc.BodyField)
+
+	// Body
+	body := p.extractBody(node, source, nc.BodyField)
+
+	// Doc comment
+	docstring := p.extractDoc(node, source)
+
+	// Calls
+	calls := p.extractCalls(node, source)
+
+	return &CodeElement{
+		ID:        id,
+		Name:      fullName,
+		Type:      nc.ElementType,
+		File:      filename,
+		Language:  p.config.Name,
+		Line:      int(node.StartPosition().Row) + 1,
+		EndLine:   int(node.EndPosition().Row) + 1,
+		Signature: sig,
+		Body:      body,
+		DocString: docstring,
+		CallsTo:   calls,
+	}
+}
+
+func (p *TreeSitterParser) extractSignature(node *sitter.Node, source []byte, bodyField string) string {
+	var end uint
+	if bodyField != "" {
+		if bodyNode := node.ChildByFieldName(bodyField); bodyNode != nil {
+			end = bodyNode.StartByte()
+		}
+	}
+	if end == 0 {
+		end = node.EndByte()
+	}
+	sig := strings.TrimSpace(string(source[node.StartByte():end]))
+	if len(sig) > 300 {
+		sig = sig[:300]
+	}
+	return sig
+}
+
+func (p *TreeSitterParser) extractBody(node *sitter.Node, source []byte, bodyField string) string {
+	if bodyField == "" {
+		return ""
+	}
+	bodyNode := node.ChildByFieldName(bodyField)
+	if bodyNode == nil {
+		return ""
+	}
+	body := string(source[bodyNode.StartByte():bodyNode.EndByte()])
+	if len(body) > 1000 {
+		body = body[:1000] + "..."
+	}
+	return body
+}
+
+func (p *TreeSitterParser) extractDoc(node *sitter.Node, source []byte) string {
+	switch p.config.DocComment {
+	case "prev_sibling":
+		prev := node.PrevNamedSibling()
+		if prev != nil && strings.Contains(prev.Kind(), "comment") {
+			return strings.TrimSpace(string(source[prev.StartByte():prev.EndByte()]))
+		}
+	case "first_child_string":
+		// Python/JS docstrings: primer hijo del body es una string
+		for _, nc := range p.config.NodeKinds {
+			if bodyNode := node.ChildByFieldName(nc.BodyField); bodyNode != nil {
+				if bodyNode.ChildCount() > 0 {
+					first := bodyNode.Child(0)
+					if first != nil {
+						txt := string(source[first.StartByte():first.EndByte()])
+						if strings.HasPrefix(txt, `"`) || strings.HasPrefix(txt, `'`) {
+							return strings.Trim(strings.TrimSpace(txt), `"'`)
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+	return ""
+}
+
+func (p *TreeSitterParser) extractCalls(node *sitter.Node, source []byte) []string {
+	seen := make(map[string]bool)
+	var calls []string
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		// call_expression es el tipo en Go/Rust/TS; call_expression o "call" en Python
+		if n.Kind() == "call_expression" || n.Kind() == "call" {
+			var funcNode *sitter.Node
+			if f := n.ChildByFieldName("function"); f != nil {
+				funcNode = f
+			} else if n.ChildCount() > 0 {
+				funcNode = n.Child(0)
+			}
+			if funcNode != nil {
+				call := strings.TrimSpace(string(source[funcNode.StartByte():funcNode.EndByte()]))
+				// Tomar solo el último segmento (obj.Method → Method)
+				if idx := strings.LastIndexAny(call, ".::"); idx >= 0 {
+					call = call[idx+1:]
+				}
+				if call != "" && !seen[call] {
+					seen[call] = true
+					calls = append(calls, call)
+				}
+			}
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			if child := n.Child(uint(i)); child != nil {
+				walk(child)
+			}
+		}
+	}
+	walk(node)
+	return calls
+}
+
+func (p *TreeSitterParser) extractImports(root *sitter.Node, source []byte) []Import {
+	var imports []Import
+	kindSet := make(map[string]ImportKindConfig)
+	for _, ik := range p.config.ImportKinds {
+		kindSet[ik.Kind] = ik
+	}
+
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		if ik, ok := kindSet[n.Kind()]; ok {
+			imp := Import{Line: int(n.StartPosition().Row) + 1}
+			if ik.PathField != "" {
+				if pathNode := n.ChildByFieldName(ik.PathField); pathNode != nil {
+					imp.Module = strings.Trim(
+						string(source[pathNode.StartByte():pathNode.EndByte()]), `"`)
+				}
+			}
+			if ik.AliasField != "" {
+				if aliasNode := n.ChildByFieldName(ik.AliasField); aliasNode != nil {
+					imp.Alias = string(source[aliasNode.StartByte():aliasNode.EndByte()])
+				}
+			}
+			if imp.Module != "" {
+				imports = append(imports, imp)
+			}
+			return
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			if child := n.Child(uint(i)); child != nil {
+				walk(child)
+			}
+		}
+	}
+	walk(root)
+	return imports
+}
+```
+
+- [ ] **Step 2: Verificar que compila**
+
+```bash
+go build ./parser/...
+```
+
+Expected: sin errores.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add parser/treesitter.go
+git commit -m "feat: add generic TreeSitterParser with LanguageConfig"
+```
+
+---
+
+### Task 3: Registro de lenguajes
+
+**Files:**
+- Create: `parser/languages.go`
+
+Este archivo registra todos los lenguajes. Para añadir un nuevo lenguaje basta añadir una entrada aquí.
+
+- [ ] **Step 1: Crear `parser/languages.go`**
+
+```go
+package parser
+
+import (
+	sitter "github.com/tree-sitter/go-tree-sitter"
+	golang "github.com/tree-sitter/tree-sitter-go/bindings/go"
+	java "github.com/tree-sitter/tree-sitter-java/bindings/go"
+	python "github.com/tree-sitter/tree-sitter-python/bindings/go"
+	rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
+	typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
+)
+
+// languageRegistry mapea extensión → LanguageConfig
+var languageRegistry = map[string]LanguageConfig{}
+
+func init() {
+	configs := []LanguageConfig{
+		goConfig(),
+		rustConfig(),
+		javaConfig(),
+		pythonConfig(),
+		typescriptConfig(".ts"),
+		typescriptConfig(".tsx"),
+		typescriptConfig(".js"),
+		typescriptConfig(".jsx"),
+	}
+	for _, c := range configs {
+		for _, ext := range c.Extensions {
+			languageRegistry[ext] = c
+		}
+	}
+}
+
+func goConfig() LanguageConfig {
+	return LanguageConfig{
+		Name:       "go",
+		Extensions: []string{".go"},
+		Language:   sitter.NewLanguage(golang.Language()),
+		DocComment: "prev_sibling",
+		NodeKinds: []NodeKindConfig{
+			{Kind: "function_declaration", NameField: "name", ElementType: "function", BodyField: "body"},
+			{Kind: "method_declaration", NameField: "name", ElementType: "method", ReceiverField: "receiver", BodyField: "body"},
+			{Kind: "type_spec", NameField: "name", ElementType: "struct", BodyField: ""},
+		},
+		ImportKinds: []ImportKindConfig{
+			{Kind: "import_spec", PathField: "path", AliasField: "name"},
+		},
+	}
+}
+
+func rustConfig() LanguageConfig {
+	return LanguageConfig{
+		Name:       "rust",
+		Extensions: []string{".rs"},
+		Language:   sitter.NewLanguage(rust.Language()),
+		DocComment: "prev_sibling",
+		NodeKinds: []NodeKindConfig{
+			{Kind: "function_item", NameField: "name", ElementType: "function", BodyField: "body"},
+			// Métodos dentro de impl_item: el ParentKind "impl_item" actualiza el implType en el walker
+			{Kind: "function_item", NameField: "name", ElementType: "method", ParentKind: "impl_item", BodyField: "body"},
+			{Kind: "struct_item", NameField: "name", ElementType: "struct", BodyField: "body"},
+			{Kind: "enum_item", NameField: "name", ElementType: "class", BodyField: "body"},
+			{Kind: "trait_item", NameField: "name", ElementType: "interface", BodyField: "body"},
+		},
+		ImportKinds: []ImportKindConfig{
+			{Kind: "use_declaration", PathField: "argument"},
+		},
+	}
+}
+
+func javaConfig() LanguageConfig {
+	return LanguageConfig{
+		Name:       "java",
+		Extensions: []string{".java"},
+		Language:   sitter.NewLanguage(java.Language()),
+		DocComment: "prev_sibling",
+		NodeKinds: []NodeKindConfig{
+			{Kind: "method_declaration", NameField: "name", ElementType: "method", BodyField: "body"},
+			{Kind: "constructor_declaration", NameField: "name", ElementType: "function", BodyField: "body"},
+			{Kind: "class_declaration", NameField: "name", ElementType: "class", BodyField: "body"},
+			{Kind: "interface_declaration", NameField: "name", ElementType: "interface", BodyField: "body"},
+		},
+		ImportKinds: []ImportKindConfig{
+			{Kind: "import_declaration", PathField: "name"},
+		},
+	}
+}
+
+func pythonConfig() LanguageConfig {
+	return LanguageConfig{
+		Name:       "python",
+		Extensions: []string{".py"},
+		Language:   sitter.NewLanguage(python.Language()),
+		DocComment: "first_child_string",
+		NodeKinds: []NodeKindConfig{
+			{Kind: "function_definition", NameField: "name", ElementType: "function", BodyField: "body"},
+			{Kind: "class_definition", NameField: "name", ElementType: "class", BodyField: "body"},
+		},
+		ImportKinds: []ImportKindConfig{
+			{Kind: "import_statement", PathField: "name"},
+			{Kind: "import_from_statement", PathField: "module_name"},
+		},
+	}
+}
+
+func typescriptConfig(ext string) LanguageConfig {
+	lang := sitter.NewLanguage(typescript.LanguageTypescript())
+	name := "typescript"
+	if ext == ".tsx" {
+		lang = sitter.NewLanguage(typescript.LanguageTSX())
+		name = "tsx"
+	} else if ext == ".js" || ext == ".jsx" {
+		name = "javascript"
+	}
+	return LanguageConfig{
+		Name:       name,
+		Extensions: []string{ext},
+		Language:   lang,
+		DocComment: "first_child_string",
+		NodeKinds: []NodeKindConfig{
+			{Kind: "function_declaration", NameField: "name", ElementType: "function", BodyField: "body"},
+			{Kind: "arrow_function", NameField: "name", ElementType: "function", BodyField: "body"},
+			{Kind: "method_definition", NameField: "name", ElementType: "method", BodyField: "body"},
+			{Kind: "class_declaration", NameField: "name", ElementType: "class", BodyField: "body"},
+			{Kind: "interface_declaration", NameField: "name", ElementType: "interface", BodyField: "body"},
+		},
+		ImportKinds: []ImportKindConfig{
+			{Kind: "import_statement", PathField: "source"},
+		},
+	}
+}
+```
+
+- [ ] **Step 2: Compilar**
+
+```bash
+go build ./parser/...
+```
+
+Expected: sin errores.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add parser/languages.go
+git commit -m "feat: add language registry with Go, Rust, Java, Python, TypeScript configs"
+```
+
+---
+
+### Task 4: Actualizar parser.go y eliminar parsers específicos
+
+**Files:**
+- Modify: `parser/parser.go`
+- Delete: `parser/python.go`
+- Delete: `parser/typescript.go`
+
+- [ ] **Step 1: Reemplazar el contenido de `parser/parser.go`**
+
+```go
+package parser
+
+import (
+	"path/filepath"
+	"strings"
+)
+
+// Parser interface para diferentes lenguajes
+type Parser interface {
+	Parse(source []byte, filename string) (*ParsedFile, error)
+	Language() string
+	Extensions() []string
+}
+
+// GetParser devuelve el parser adecuado para un archivo, o nil si no se soporta
+func GetParser(filename string) Parser {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if config, ok := languageRegistry[ext]; ok {
+		return NewTreeSitterParser(config)
+	}
+	return nil
+}
+
+// DetectLanguage detecta el lenguaje basándose en la extensión del archivo
+func DetectLanguage(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if config, ok := languageRegistry[ext]; ok {
+		return config.Name
+	}
+	return "unknown"
+}
+
+// IsCodeFile verifica si el archivo es código parseable
+func IsCodeFile(filename string) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	_, ok := languageRegistry[ext]
+	return ok
+}
+
+// ShouldSkipPath verifica si debemos saltar este path
+func ShouldSkipPath(path string) bool {
+	skipDirs := []string{
+		"node_modules",
+		"__pycache__",
+		".git",
+		".venv",
+		"venv",
+		"env",
+		"dist",
+		"build",
+		".next",
+		".nuxt",
+		"coverage",
+		".pytest_cache",
+		".mypy_cache",
+	}
+
+	pathLower := strings.ToLower(path)
+	for _, skip := range skipDirs {
+		if strings.Contains(pathLower, skip) {
+			return true
+		}
+	}
+	return false
+}
+```
+
+- [ ] **Step 2: Eliminar los parsers específicos**
+
+```bash
+rm parser/python.go parser/typescript.go
+```
+
+- [ ] **Step 3: Verificar que nada usa NewPythonParser/NewTypeScriptParser directamente**
+
+```bash
+grep -r "NewPythonParser\|NewTypeScriptParser\|NewGoParser\|NewRustParser\|NewJavaParser" --include="*.go" .
+```
+
+Expected: 0 resultados. Si hay resultados, reemplazarlos por `parser.GetParser(filename)`.
+
+- [ ] **Step 4: Compilar todo el proyecto**
+
+```bash
+go build ./...
+```
+
+Expected: sin errores.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add parser/parser.go
+git rm parser/python.go parser/typescript.go
+git commit -m "feat: replace per-language parsers with generic TreeSitterParser registry"
+```
+
+---
+
+### Task 5: Actualizar main.go para usar GetParser
+
+**Files:**
+- Modify: `main.go`
+
+- [ ] **Step 1: Verificar cómo se usan los parsers en main.go**
+
+```bash
+grep -n "PythonParser\|TypeScriptParser\|parser\." main.go | head -20
+```
+
+- [ ] **Step 2: Reemplazar la selección de parser por GetParser**
+
+Buscar el bloque que selecciona el parser según el lenguaje (probablemente algo como):
+```go
+switch lang {
+case "python":
+    p = parser.NewPythonParser()
+case "typescript", "javascript":
+    p = parser.NewTypeScriptParser()
+}
+```
+
+Reemplazarlo por:
+```go
+p := parser.GetParser(filePath)
+if p == nil {
+    continue // lenguaje no soportado
+}
+```
+
+- [ ] **Step 3: Compilar**
+
+```bash
+go build ./...
+```
+
+Expected: sin errores.
+
+- [ ] **Step 4: Probar indexado**
+
+```bash
+go run . index -repo test/sample-repo
+```
+
+Expected: indexa archivos .ts sin errores.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add main.go
+git commit -m "feat: use parser.GetParser in indexer — supports all registered languages"
+```
+
+---
+
+### Task 6: Tests del parser genérico
+
+**Files:**
+- Create: `tests/parser_test.go`
+
+- [ ] **Step 1: Crear tests para Go, Rust, Python (los 3 nuevos o migrados)**
 
 Crear `tests/parser_test.go`:
 ```go
@@ -79,8 +749,7 @@ import (
 )
 
 func TestGoParser(t *testing.T) {
-	// Write a temp Go file
-	src := []byte(`package main
+	f := writeTempFile(t, "*.go", []byte(`package main
 
 import "fmt"
 
@@ -95,368 +764,20 @@ func NewServer(port int) *Server {
 func (s *Server) Start() {
 	fmt.Println("started")
 }
-`)
-	f, _ := os.CreateTemp("", "test_*.go")
-	f.Write(src)
-	f.Close()
-	defer os.Remove(f.Name())
-
-	p := parser.NewGoParser()
-	result, err := p.ParseFile(f.Name())
+`))
+	result, err := parser.GetParser(f).ParseFile(f)
 	if err != nil {
 		t.Fatalf("ParseFile failed: %v", err)
 	}
 	if result.Language != "go" {
 		t.Errorf("expected language=go, got %s", result.Language)
 	}
-
-	names := make(map[string]bool)
-	for _, e := range result.Elements {
-		names[e.Name] = true
-	}
-	if !names["NewServer"] {
-		t.Error("expected to find function NewServer")
-	}
-	if !names["Server.Start"] {
-		t.Error("expected to find method Server.Start")
-	}
-	if !names["Server"] {
-		t.Error("expected to find struct Server")
-	}
-	if len(result.Imports) == 0 {
-		t.Error("expected at least one import")
-	}
-}
-```
-
-- [ ] **Step 2: Ejecutar test para confirmar que falla**
-
-```bash
-go test ./tests/... -run TestGoParser -v
-```
-
-Expected: FAIL con "undefined: parser.NewGoParser"
-
-- [ ] **Step 3: Implementar el parser de Go**
-
-Crear `parser/go_parser.go`:
-```go
-package parser
-
-import (
-	"fmt"
-	"os"
-	"strings"
-	"time"
-
-	sitter "github.com/tree-sitter/go-tree-sitter"
-	golang "github.com/tree-sitter/tree-sitter-go/bindings/go"
-)
-
-type GoParser struct {
-	language *sitter.Language
+	assertElementFound(t, result, "NewServer")
+	assertElementFound(t, result, "Server.Start")
 }
 
-func NewGoParser() *GoParser {
-	return &GoParser{
-		language: sitter.NewLanguage(golang.Language()),
-	}
-}
-
-func (p *GoParser) Language() string        { return "go" }
-func (p *GoParser) Extensions() []string    { return []string{".go"} }
-
-func (p *GoParser) ParseFile(fp string) (*ParsedFile, error) {
-	source, err := os.ReadFile(fp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
-	}
-	return p.Parse(source, fp)
-}
-
-func (p *GoParser) Parse(source []byte, filename string) (*ParsedFile, error) {
-	start := time.Now()
-
-	par := sitter.NewParser()
-	defer par.Close()
-
-	if err := par.SetLanguage(p.language); err != nil {
-		return nil, fmt.Errorf("failed to set language: %w", err)
-	}
-
-	tree := par.Parse(source, nil)
-	defer tree.Close()
-
-	parsed := &ParsedFile{
-		Path:     filename,
-		Language: "go",
-		Elements: []CodeElement{},
-		Imports:  []Import{},
-	}
-
-	root := tree.RootNode()
-	parsed.Imports = p.extractImports(root, source)
-	p.walkNode(root, source, filename, parsed)
-	parsed.ParseTime = time.Since(start).Milliseconds()
-	return parsed, nil
-}
-
-func (p *GoParser) walkNode(node *sitter.Node, source []byte, filename string, parsed *ParsedFile) {
-	switch node.Kind() {
-	case "function_declaration":
-		if elem := p.extractFunction(node, source, filename); elem != nil {
-			parsed.Elements = append(parsed.Elements, *elem)
-		}
-		return // don't recurse into function body for top-level walk
-	case "method_declaration":
-		if elem := p.extractMethod(node, source, filename); elem != nil {
-			parsed.Elements = append(parsed.Elements, *elem)
-		}
-		return
-	case "type_declaration":
-		if elem := p.extractTypeDecl(node, source, filename); elem != nil {
-			parsed.Elements = append(parsed.Elements, *elem)
-		}
-		return
-	}
-	for i := 0; i < int(node.ChildCount()); i++ {
-		if child := node.Child(uint(i)); child != nil {
-			p.walkNode(child, source, filename, parsed)
-		}
-	}
-}
-
-func (p *GoParser) extractFunction(node *sitter.Node, source []byte, filename string) *CodeElement {
-	nameNode := node.ChildByFieldName("name")
-	if nameNode == nil {
-		return nil
-	}
-	name := string(source[nameNode.StartByte():nameNode.EndByte()])
-	id := fmt.Sprintf("%s:%s", filename, name)
-
-	sig := p.nodeSignature(node, source)
-	body := p.nodeBody(node, source)
-
-	return &CodeElement{
-		ID:        id,
-		Name:      name,
-		Type:      "function",
-		File:      filename,
-		Language:  "go",
-		Line:      int(node.StartPosition().Row) + 1,
-		EndLine:   int(node.EndPosition().Row) + 1,
-		Signature: sig,
-		Body:      body,
-		CallsTo:   p.extractCalls(node, source),
-		DocString: p.extractDocComment(node, source),
-	}
-}
-
-func (p *GoParser) extractMethod(node *sitter.Node, source []byte, filename string) *CodeElement {
-	nameNode := node.ChildByFieldName("name")
-	if nameNode == nil {
-		return nil
-	}
-	name := string(source[nameNode.StartByte():nameNode.EndByte()])
-
-	receiverType := p.extractReceiverType(node, source)
-	fullName := name
-	if receiverType != "" {
-		fullName = receiverType + "." + name
-	}
-
-	id := fmt.Sprintf("%s:%s", filename, fullName)
-	sig := p.nodeSignature(node, source)
-	body := p.nodeBody(node, source)
-
-	return &CodeElement{
-		ID:        id,
-		Name:      fullName,
-		Type:      "method",
-		File:      filename,
-		Language:  "go",
-		Line:      int(node.StartPosition().Row) + 1,
-		EndLine:   int(node.EndPosition().Row) + 1,
-		Signature: sig,
-		Body:      body,
-		CallsTo:   p.extractCalls(node, source),
-		DocString: p.extractDocComment(node, source),
-	}
-}
-
-func (p *GoParser) extractTypeDecl(node *sitter.Node, source []byte, filename string) *CodeElement {
-	for i := 0; i < int(node.ChildCount()); i++ {
-		child := node.Child(uint(i))
-		if child == nil || child.Kind() != "type_spec" {
-			continue
-		}
-		nameNode := child.ChildByFieldName("name")
-		typeNode := child.ChildByFieldName("type")
-		if nameNode == nil {
-			continue
-		}
-		name := string(source[nameNode.StartByte():nameNode.EndByte()])
-		elemType := "type"
-		if typeNode != nil {
-			switch typeNode.Kind() {
-			case "struct_type":
-				elemType = "struct"
-			case "interface_type":
-				elemType = "interface"
-			}
-		}
-		sig := strings.TrimSpace(string(source[node.StartByte():node.EndByte()]))
-		if len(sig) > 300 {
-			sig = sig[:300]
-		}
-		return &CodeElement{
-			ID:        fmt.Sprintf("%s:%s", filename, name),
-			Name:      name,
-			Type:      elemType,
-			File:      filename,
-			Language:  "go",
-			Line:      int(node.StartPosition().Row) + 1,
-			EndLine:   int(node.EndPosition().Row) + 1,
-			Signature: sig,
-		}
-	}
-	return nil
-}
-
-func (p *GoParser) extractReceiverType(node *sitter.Node, source []byte) string {
-	recv := node.ChildByFieldName("receiver")
-	if recv == nil {
-		return ""
-	}
-	text := string(source[recv.StartByte():recv.EndByte()])
-	// "(s *Server)" → "Server"
-	text = strings.Trim(text, "()")
-	parts := strings.Fields(text)
-	for _, part := range parts {
-		clean := strings.Trim(part, "*[]")
-		if clean != "" && !strings.ContainsAny(clean, "()") {
-			return clean
-		}
-	}
-	return ""
-}
-
-func (p *GoParser) nodeSignature(node *sitter.Node, source []byte) string {
-	bodyNode := node.ChildByFieldName("body")
-	var end uint
-	if bodyNode != nil {
-		end = bodyNode.StartByte()
-	} else {
-		end = node.EndByte()
-	}
-	sig := strings.TrimSpace(string(source[node.StartByte():end]))
-	if len(sig) > 300 {
-		sig = sig[:300]
-	}
-	return sig
-}
-
-func (p *GoParser) nodeBody(node *sitter.Node, source []byte) string {
-	bodyNode := node.ChildByFieldName("body")
-	if bodyNode == nil {
-		return ""
-	}
-	body := string(source[bodyNode.StartByte():bodyNode.EndByte()])
-	if len(body) > 1000 {
-		body = body[:1000] + "..."
-	}
-	return body
-}
-
-func (p *GoParser) extractDocComment(node *sitter.Node, source []byte) string {
-	// Go doc comments are the comment_group immediately before the declaration
-	prev := node.PrevNamedSibling()
-	if prev != nil && prev.Kind() == "comment" {
-		return strings.TrimSpace(string(source[prev.StartByte():prev.EndByte()]))
-	}
-	return ""
-}
-
-func (p *GoParser) extractCalls(node *sitter.Node, source []byte) []string {
-	seen := make(map[string]bool)
-	var calls []string
-	var walk func(*sitter.Node)
-	walk = func(n *sitter.Node) {
-		if n.Kind() == "call_expression" {
-			fn := n.ChildByFieldName("function")
-			if fn != nil {
-				call := strings.TrimSpace(string(source[fn.StartByte():fn.EndByte()]))
-				if !seen[call] {
-					seen[call] = true
-					calls = append(calls, call)
-				}
-			}
-		}
-		for i := 0; i < int(n.ChildCount()); i++ {
-			if child := n.Child(uint(i)); child != nil {
-				walk(child)
-			}
-		}
-	}
-	walk(node)
-	return calls
-}
-
-func (p *GoParser) extractImports(root *sitter.Node, source []byte) []Import {
-	var imports []Import
-	var walk func(*sitter.Node)
-	walk = func(n *sitter.Node) {
-		if n.Kind() == "import_spec" {
-			pathNode := n.ChildByFieldName("path")
-			if pathNode != nil {
-				path := strings.Trim(string(source[pathNode.StartByte():pathNode.EndByte()]), `"`)
-				imp := Import{Module: path, Line: int(n.StartPosition().Row) + 1}
-				if alias := n.ChildByFieldName("name"); alias != nil {
-					imp.Alias = string(source[alias.StartByte():alias.EndByte()])
-				}
-				imports = append(imports, imp)
-			}
-		}
-		for i := 0; i < int(n.ChildCount()); i++ {
-			if child := n.Child(uint(i)); child != nil {
-				walk(child)
-			}
-		}
-	}
-	walk(root)
-	return imports
-}
-```
-
-- [ ] **Step 4: Ejecutar test**
-
-```bash
-go test ./tests/... -run TestGoParser -v
-```
-
-Expected: PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add parser/go_parser.go tests/parser_test.go
-git commit -m "feat: add Go language parser via tree-sitter"
-```
-
----
-
-### Task 3: Parser de Rust
-
-**Files:**
-- Create: `parser/rust_parser.go`
-- Modify: `tests/parser_test.go`
-
-- [ ] **Step 1: Añadir test para Rust**
-
-Añadir al final de `tests/parser_test.go`:
-```go
 func TestRustParser(t *testing.T) {
-	src := []byte(`use std::io;
+	f := writeTempFile(t, "*.rs", []byte(`use std::io;
 
 pub struct Config {
     pub port: u16,
@@ -468,905 +789,266 @@ pub fn new_config(port: u16) -> Config {
 
 impl Config {
     pub fn start(&self) {
-        println!("started on {}", self.port);
+        println!("started");
     }
 }
-`)
-	f, _ := os.CreateTemp("", "test_*.rs")
-	f.Write(src)
-	f.Close()
-	defer os.Remove(f.Name())
-
-	p := parser.NewRustParser()
-	result, err := p.ParseFile(f.Name())
+`))
+	result, err := parser.GetParser(f).ParseFile(f)
 	if err != nil {
 		t.Fatalf("ParseFile failed: %v", err)
 	}
 	if result.Language != "rust" {
 		t.Errorf("expected language=rust, got %s", result.Language)
 	}
-	names := make(map[string]bool)
-	for _, e := range result.Elements {
-		names[e.Name] = true
-	}
-	if !names["new_config"] {
-		t.Error("expected to find function new_config")
-	}
-	if !names["Config"] {
-		t.Error("expected to find struct Config")
-	}
-}
-```
-
-- [ ] **Step 2: Verificar que falla**
-
-```bash
-go test ./tests/... -run TestRustParser -v
-```
-
-Expected: FAIL
-
-- [ ] **Step 3: Implementar parser de Rust**
-
-Crear `parser/rust_parser.go`:
-```go
-package parser
-
-import (
-	"fmt"
-	"os"
-	"strings"
-	"time"
-
-	sitter "github.com/tree-sitter/go-tree-sitter"
-	rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
-)
-
-type RustParser struct {
-	language *sitter.Language
+	assertElementFound(t, result, "new_config")
+	assertElementFound(t, result, "Config")
 }
 
-func NewRustParser() *RustParser {
-	return &RustParser{language: sitter.NewLanguage(rust.Language())}
-}
+func TestPythonParser(t *testing.T) {
+	f := writeTempFile(t, "*.py", []byte(`class Greeter:
+    def greet(self, name: str) -> str:
+        return f"hello {name}"
 
-func (p *RustParser) Language() string     { return "rust" }
-func (p *RustParser) Extensions() []string { return []string{".rs"} }
-
-func (p *RustParser) ParseFile(fp string) (*ParsedFile, error) {
-	source, err := os.ReadFile(fp)
+def standalone():
+    pass
+`))
+	result, err := parser.GetParser(f).ParseFile(f)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
+		t.Fatalf("ParseFile failed: %v", err)
 	}
-	return p.Parse(source, fp)
+	if result.Language != "python" {
+		t.Errorf("expected language=python, got %s", result.Language)
+	}
+	assertElementFound(t, result, "Greeter")
+	assertElementFound(t, result, "standalone")
 }
 
-func (p *RustParser) Parse(source []byte, filename string) (*ParsedFile, error) {
-	start := time.Now()
-
-	par := sitter.NewParser()
-	defer par.Close()
-	if err := par.SetLanguage(p.language); err != nil {
-		return nil, fmt.Errorf("failed to set language: %w", err)
-	}
-
-	tree := par.Parse(source, nil)
-	defer tree.Close()
-
-	parsed := &ParsedFile{
-		Path: filename, Language: "rust",
-		Elements: []CodeElement{}, Imports: []Import{},
-	}
-
-	root := tree.RootNode()
-	parsed.Imports = p.extractUses(root, source)
-	p.walkNode(root, source, filename, parsed, "")
-	parsed.ParseTime = time.Since(start).Milliseconds()
-	return parsed, nil
-}
-
-func (p *RustParser) walkNode(node *sitter.Node, source []byte, filename string, parsed *ParsedFile, implType string) {
-	switch node.Kind() {
-	case "function_item":
-		elemType := "function"
-		name := ""
-		if implType != "" {
-			elemType = "method"
-		}
-		if nameNode := node.ChildByFieldName("name"); nameNode != nil {
-			name = string(source[nameNode.StartByte():nameNode.EndByte()])
-		}
-		if name == "" {
-			break
-		}
-		fullName := name
-		if implType != "" {
-			fullName = implType + "::" + name
-		}
-		bodyNode := node.ChildByFieldName("body")
-		var sig string
-		if bodyNode != nil {
-			sig = strings.TrimSpace(string(source[node.StartByte():bodyNode.StartByte()]))
-		} else {
-			sig = strings.TrimSpace(string(source[node.StartByte():node.EndByte()]))
-		}
-		if len(sig) > 300 {
-			sig = sig[:300]
-		}
-		body := ""
-		if bodyNode != nil {
-			body = string(source[bodyNode.StartByte():bodyNode.EndByte()])
-			if len(body) > 1000 {
-				body = body[:1000] + "..."
-			}
-		}
-		parsed.Elements = append(parsed.Elements, CodeElement{
-			ID:        fmt.Sprintf("%s:%s", filename, fullName),
-			Name:      fullName,
-			Type:      elemType,
-			File:      filename,
-			Language:  "rust",
-			Line:      int(node.StartPosition().Row) + 1,
-			EndLine:   int(node.EndPosition().Row) + 1,
-			Signature: sig,
-			Body:      body,
-			CallsTo:   p.extractCalls(node, source),
-		})
-		return
-	case "struct_item":
-		if nameNode := node.ChildByFieldName("name"); nameNode != nil {
-			name := string(source[nameNode.StartByte():nameNode.EndByte()])
-			sig := strings.TrimSpace(string(source[node.StartByte():node.EndByte()]))
-			if len(sig) > 300 {
-				sig = sig[:300]
-			}
-			parsed.Elements = append(parsed.Elements, CodeElement{
-				ID: fmt.Sprintf("%s:%s", filename, name), Name: name,
-				Type: "struct", File: filename, Language: "rust",
-				Line: int(node.StartPosition().Row) + 1, EndLine: int(node.EndPosition().Row) + 1,
-				Signature: sig,
-			})
-		}
-		return
-	case "impl_item":
-		// Extract the type this impl is for
-		typeNode := node.ChildByFieldName("type")
-		implT := ""
-		if typeNode != nil {
-			implT = string(source[typeNode.StartByte():typeNode.EndByte()])
-		}
-		for i := 0; i < int(node.ChildCount()); i++ {
-			if child := node.Child(uint(i)); child != nil {
-				p.walkNode(child, source, filename, parsed, implT)
-			}
-		}
-		return
-	}
-	for i := 0; i < int(node.ChildCount()); i++ {
-		if child := node.Child(uint(i)); child != nil {
-			p.walkNode(child, source, filename, parsed, implType)
-		}
-	}
-}
-
-func (p *RustParser) extractCalls(node *sitter.Node, source []byte) []string {
-	seen := make(map[string]bool)
-	var calls []string
-	var walk func(*sitter.Node)
-	walk = func(n *sitter.Node) {
-		if n.Kind() == "call_expression" {
-			if fn := n.ChildByFieldName("function"); fn != nil {
-				call := strings.TrimSpace(string(source[fn.StartByte():fn.EndByte()]))
-				if !seen[call] {
-					seen[call] = true
-					calls = append(calls, call)
-				}
-			}
-		}
-		for i := 0; i < int(n.ChildCount()); i++ {
-			if child := n.Child(uint(i)); child != nil {
-				walk(child)
-			}
-		}
-	}
-	walk(node)
-	return calls
-}
-
-func (p *RustParser) extractUses(root *sitter.Node, source []byte) []Import {
-	var imports []Import
-	var walk func(*sitter.Node)
-	walk = func(n *sitter.Node) {
-		if n.Kind() == "use_declaration" {
-			text := strings.TrimSpace(string(source[n.StartByte():n.EndByte()]))
-			text = strings.TrimPrefix(text, "use ")
-			text = strings.TrimSuffix(text, ";")
-			imports = append(imports, Import{Module: text, Line: int(n.StartPosition().Row) + 1})
-		}
-		for i := 0; i < int(n.ChildCount()); i++ {
-			if child := n.Child(uint(i)); child != nil {
-				walk(child)
-			}
-		}
-	}
-	walk(root)
-	return imports
-}
-```
-
-- [ ] **Step 4: Ejecutar test**
-
-```bash
-go test ./tests/... -run TestRustParser -v
-```
-
-Expected: PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add parser/rust_parser.go tests/parser_test.go
-git commit -m "feat: add Rust language parser via tree-sitter"
-```
-
----
-
-### Task 4: Parser de Java
-
-**Files:**
-- Create: `parser/java_parser.go`
-- Modify: `tests/parser_test.go`
-
-- [ ] **Step 1: Añadir test para Java**
-
-Añadir al final de `tests/parser_test.go`:
-```go
 func TestJavaParser(t *testing.T) {
-	src := []byte(`import java.util.List;
-
-public class UserService {
-    private String name;
-
-    public UserService(String name) {
-        this.name = name;
-    }
-
-    public String getName() {
-        return this.name;
+	f := writeTempFile(t, "*.java", []byte(`public class Calculator {
+    public int add(int a, int b) {
+        return a + b;
     }
 }
-`)
-	f, _ := os.CreateTemp("", "test_*.java")
-	f.Write(src)
-	f.Close()
-	defer os.Remove(f.Name())
-
-	p := parser.NewJavaParser()
-	result, err := p.ParseFile(f.Name())
+`))
+	result, err := parser.GetParser(f).ParseFile(f)
 	if err != nil {
 		t.Fatalf("ParseFile failed: %v", err)
 	}
 	if result.Language != "java" {
 		t.Errorf("expected language=java, got %s", result.Language)
 	}
-	names := make(map[string]bool)
+	assertElementFound(t, result, "Calculator")
+	assertElementFound(t, result, "add")
+}
+
+func TestGetParserReturnsNilForUnknown(t *testing.T) {
+	p := parser.GetParser("somefile.xyz")
+	if p != nil {
+		t.Error("expected nil parser for unknown extension")
+	}
+}
+
+// helpers
+
+func writeTempFile(t *testing.T, pattern string, content []byte) string {
+	t.Helper()
+	f, err := os.CreateTemp("", pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write(content)
+	f.Close()
+	t.Cleanup(func() { os.Remove(f.Name()) })
+	return f.Name()
+}
+
+func assertElementFound(t *testing.T, result *parser.ParsedFile, name string) {
+	t.Helper()
 	for _, e := range result.Elements {
-		names[e.Name] = true
+		if e.Name == name {
+			return
+		}
 	}
-	if !names["UserService"] {
-		t.Error("expected to find class UserService")
+	t.Errorf("expected to find element %q; got: %v", name, elementNames(result))
+}
+
+func elementNames(result *parser.ParsedFile) []string {
+	names := make([]string, len(result.Elements))
+	for i, e := range result.Elements {
+		names[i] = e.Name
 	}
-	if !names["UserService.getName"] {
-		t.Error("expected to find method UserService.getName")
-	}
+	return names
 }
 ```
 
-- [ ] **Step 2: Verificar que falla**
+- [ ] **Step 2: Ejecutar los tests**
 
 ```bash
-go test ./tests/... -run TestJavaParser -v
+go test ./tests/... -run "TestGoParser|TestRustParser|TestPythonParser|TestJavaParser|TestGetParser" -v
 ```
 
-Expected: FAIL
+Expected: todos PASS. Si algún test falla por nombre de campo AST incorrecto (diferente versión de gramática), ajustar el `NameField`/`BodyField` en `languages.go` según el mensaje de error.
 
-- [ ] **Step 3: Implementar parser de Java**
-
-Crear `parser/java_parser.go`:
-```go
-package parser
-
-import (
-	"fmt"
-	"os"
-	"strings"
-	"time"
-
-	sitter "github.com/tree-sitter/go-tree-sitter"
-	java "github.com/tree-sitter/tree-sitter-java/bindings/go"
-)
-
-type JavaParser struct {
-	language *sitter.Language
-}
-
-func NewJavaParser() *JavaParser {
-	return &JavaParser{language: sitter.NewLanguage(java.Language())}
-}
-
-func (p *JavaParser) Language() string     { return "java" }
-func (p *JavaParser) Extensions() []string { return []string{".java"} }
-
-func (p *JavaParser) ParseFile(fp string) (*ParsedFile, error) {
-	source, err := os.ReadFile(fp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
-	}
-	return p.Parse(source, fp)
-}
-
-func (p *JavaParser) Parse(source []byte, filename string) (*ParsedFile, error) {
-	start := time.Now()
-
-	par := sitter.NewParser()
-	defer par.Close()
-	if err := par.SetLanguage(p.language); err != nil {
-		return nil, fmt.Errorf("failed to set language: %w", err)
-	}
-
-	tree := par.Parse(source, nil)
-	defer tree.Close()
-
-	parsed := &ParsedFile{
-		Path: filename, Language: "java",
-		Elements: []CodeElement{}, Imports: []Import{},
-	}
-
-	root := tree.RootNode()
-	parsed.Imports = p.extractImports(root, source)
-	p.walkNode(root, source, filename, parsed, "")
-	parsed.ParseTime = time.Since(start).Milliseconds()
-	return parsed, nil
-}
-
-func (p *JavaParser) walkNode(node *sitter.Node, source []byte, filename string, parsed *ParsedFile, className string) {
-	switch node.Kind() {
-	case "class_declaration":
-		nameNode := node.ChildByFieldName("name")
-		if nameNode == nil {
-			break
-		}
-		cName := string(source[nameNode.StartByte():nameNode.EndByte()])
-		sig := strings.TrimSpace(string(source[node.StartByte():node.StartByte()+uint(min(300, int(node.EndByte()-node.StartByte())))]))
-		parsed.Elements = append(parsed.Elements, CodeElement{
-			ID: fmt.Sprintf("%s:%s", filename, cName), Name: cName,
-			Type: "class", File: filename, Language: "java",
-			Line: int(node.StartPosition().Row) + 1, EndLine: int(node.EndPosition().Row) + 1,
-			Signature: sig,
-		})
-		// Walk class body with class name context
-		for i := 0; i < int(node.ChildCount()); i++ {
-			if child := node.Child(uint(i)); child != nil {
-				p.walkNode(child, source, filename, parsed, cName)
-			}
-		}
-		return
-	case "method_declaration", "constructor_declaration":
-		nameNode := node.ChildByFieldName("name")
-		if nameNode == nil {
-			break
-		}
-		name := string(source[nameNode.StartByte():nameNode.EndByte()])
-		fullName := name
-		if className != "" {
-			fullName = className + "." + name
-		}
-		bodyNode := node.ChildByFieldName("body")
-		var sig string
-		if bodyNode != nil {
-			sig = strings.TrimSpace(string(source[node.StartByte():bodyNode.StartByte()]))
-		} else {
-			sig = strings.TrimSpace(string(source[node.StartByte():node.EndByte()]))
-		}
-		if len(sig) > 300 {
-			sig = sig[:300]
-		}
-		body := ""
-		if bodyNode != nil {
-			body = string(source[bodyNode.StartByte():bodyNode.EndByte()])
-			if len(body) > 1000 {
-				body = body[:1000] + "..."
-			}
-		}
-		parsed.Elements = append(parsed.Elements, CodeElement{
-			ID: fmt.Sprintf("%s:%s", filename, fullName), Name: fullName,
-			Type: "method", File: filename, Language: "java",
-			Line: int(node.StartPosition().Row) + 1, EndLine: int(node.EndPosition().Row) + 1,
-			Signature: sig, Body: body,
-			CallsTo: p.extractCalls(node, source),
-		})
-		return
-	}
-	for i := 0; i < int(node.ChildCount()); i++ {
-		if child := node.Child(uint(i)); child != nil {
-			p.walkNode(child, source, filename, parsed, className)
-		}
-	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func (p *JavaParser) extractCalls(node *sitter.Node, source []byte) []string {
-	seen := make(map[string]bool)
-	var calls []string
-	var walk func(*sitter.Node)
-	walk = func(n *sitter.Node) {
-		if n.Kind() == "method_invocation" {
-			if name := n.ChildByFieldName("name"); name != nil {
-				call := string(source[name.StartByte():name.EndByte()])
-				if !seen[call] {
-					seen[call] = true
-					calls = append(calls, call)
-				}
-			}
-		}
-		for i := 0; i < int(n.ChildCount()); i++ {
-			if child := n.Child(uint(i)); child != nil {
-				walk(child)
-			}
-		}
-	}
-	walk(node)
-	return calls
-}
-
-func (p *JavaParser) extractImports(root *sitter.Node, source []byte) []Import {
-	var imports []Import
-	var walk func(*sitter.Node)
-	walk = func(n *sitter.Node) {
-		if n.Kind() == "import_declaration" {
-			text := strings.TrimSpace(string(source[n.StartByte():n.EndByte()]))
-			text = strings.TrimPrefix(text, "import ")
-			text = strings.TrimSuffix(text, ";")
-			imports = append(imports, Import{Module: strings.TrimSpace(text), Line: int(n.StartPosition().Row) + 1})
-		}
-		for i := 0; i < int(n.ChildCount()); i++ {
-			if child := n.Child(uint(i)); child != nil {
-				walk(child)
-			}
-		}
-	}
-	walk(root)
-	return imports
-}
-```
-
-- [ ] **Step 4: Ejecutar tests**
+- [ ] **Step 3: Commit**
 
 ```bash
-go test ./tests/... -v
-```
-
-Expected: todos los tests PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add parser/java_parser.go tests/parser_test.go
-git commit -m "feat: add Java language parser via tree-sitter"
+git add tests/parser_test.go
+git commit -m "test: add generic parser tests for Go, Rust, Python, Java"
 ```
 
 ---
 
-### Task 5: Registrar los nuevos parsers en el sistema
-
-**Files:**
-- Modify: `parser/parser.go`
-- Modify: `main.go`
-
-- [ ] **Step 1: Actualizar DetectLanguage e IsCodeFile**
-
-En `parser/parser.go`, reemplazar las funciones `DetectLanguage` e `IsCodeFile`:
-```go
-func DetectLanguage(filename string) string {
-	ext := strings.ToLower(filepath.Ext(filename))
-	switch ext {
-	case ".py":
-		return "python"
-	case ".ts", ".tsx":
-		return "typescript"
-	case ".js", ".jsx":
-		return "javascript"
-	case ".go":
-		return "go"
-	case ".rs":
-		return "rust"
-	case ".java":
-		return "java"
-	default:
-		return "unknown"
-	}
-}
-
-func IsCodeFile(filename string) bool {
-	ext := strings.ToLower(filepath.Ext(filename))
-	validExts := map[string]bool{
-		".py":   true,
-		".ts":   true,
-		".tsx":  true,
-		".js":   true,
-		".jsx":  true,
-		".go":   true,
-		".rs":   true,
-		".java": true,
-	}
-	return validExts[ext]
-}
-```
-
-- [ ] **Step 2: Actualizar indexRepository en main.go**
-
-En `main.go`, función `indexRepository`, reemplazar la inicialización de parsers y el switch:
-```go
-func indexRepository(repoPath string) {
-	fmt.Printf("🔍 Indexing: %s\n", repoPath)
-
-	dbPath := "code_graph.db"
-	database, err := db.InitDB(dbPath)
-	if err != nil {
-		fmt.Printf("❌ Failed to initialize database: %v\n", err)
-		os.Exit(1)
-	}
-	defer database.Close()
-
-	codeGraph := graph.NewGraph(database)
-
-	parsers := map[string]interface {
-		ParseFile(string) (*parser.ParsedFile, error)
-	}{
-		"python":     parser.NewPythonParser(),
-		"typescript": parser.NewTypeScriptParser(),
-		"javascript": parser.NewTypeScriptParser(),
-		"go":         parser.NewGoParser(),
-		"rust":       parser.NewRustParser(),
-		"java":       parser.NewJavaParser(),
-	}
-
-	parsedFiles := make(map[string]*parser.ParsedFile)
-	totalFiles := 0
-
-	err = filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			if parser.ShouldSkipPath(path) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !parser.IsCodeFile(path) {
-			return nil
-		}
-
-		lang := parser.DetectLanguage(path)
-		p, ok := parsers[lang]
-		if !ok {
-			return nil
-		}
-
-		relPath, _ := filepath.Rel(repoPath, path)
-		parsed, err := p.ParseFile(path)
-		if err != nil {
-			fmt.Printf("  ⚠ Error parsing %s: %v\n", relPath, err)
-			return nil
-		}
-		parsed.Path = relPath
-		for i := range parsed.Elements {
-			parsed.Elements[i].File = relPath
-		}
-		parsedFiles[relPath] = parsed
-		totalFiles++
-		fmt.Printf("  ✓ %s (%d elements)\n", relPath, len(parsed.Elements))
-		return nil
-	})
-
-	if err != nil {
-		fmt.Printf("❌ Walk error: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := codeGraph.BuildFromParsed(parsedFiles); err != nil {
-		fmt.Printf("❌ Failed to build graph: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := codeGraph.ResolveCallEdges(); err != nil {
-		fmt.Printf("⚠ Warning: Failed to resolve call edges: %v\n", err)
-	}
-
-	nodes, edges, err := codeGraph.Stats()
-	if err != nil {
-		fmt.Printf("❌ Failed to get stats: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("\n✅ Indexed %d files\n", totalFiles)
-	fmt.Printf("   Nodes: %d\n", nodes)
-	fmt.Printf("   Edges: %d\n", edges)
-	fmt.Printf("   Database: %s\n", dbPath)
-}
-```
-
-- [ ] **Step 3: Compilar y verificar**
-
-```bash
-go build ./...
-```
-
-Expected: sin errores.
-
-- [ ] **Step 4: Test de integración — indexar el propio repo**
-
-```bash
-go run . index -repo .
-```
-
-Expected: aparecen archivos `.go` en la lista con sus elementos.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add parser/parser.go main.go
-git commit -m "feat: register Go, Rust, Java parsers in indexer"
-```
-
----
-
-### Task 6: File Watcher
+### Task 7: File Watcher
 
 **Files:**
 - Create: `watcher/watcher.go`
-- Modify: `graph/builder.go`
 - Modify: `main.go`
 
-- [ ] **Step 1: Añadir RemoveFileNodes al graph**
-
-En `graph/builder.go`, añadir al final:
-```go
-// RemoveFileNodes elimina todos los nodos de un archivo del grafo
-func (g *CodeGraph) RemoveFileNodes(file string) error {
-	_, err := g.DB.Exec(`DELETE FROM nodes WHERE file = ?`, file)
-	return err
-}
-```
-
-- [ ] **Step 2: Crear watcher/watcher.go**
+- [ ] **Step 1: Crear `watcher/watcher.go`**
 
 ```go
 package watcher
 
 import (
 	"log"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/ruffini/prism/graph"
 	"github.com/ruffini/prism/parser"
 )
 
-// Watcher observa cambios en el filesystem y reindexea archivos
-type Watcher struct {
-	fsw    *fsnotify.Watcher
-	graph  *graph.CodeGraph
-	repo   string
-	logger *log.Logger
-}
+// IndexFn es la función que reindexea un único archivo
+type IndexFn func(path string) error
 
-// New crea un nuevo Watcher
-func New(g *graph.CodeGraph, repoPath string, logger *log.Logger) (*Watcher, error) {
-	fsw, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, err
-	}
-	return &Watcher{fsw: fsw, graph: g, repo: repoPath, logger: logger}, nil
-}
+// RemoveFn elimina los nodos de un archivo del grafo
+type RemoveFn func(path string) error
 
-// Start inicia el watcher en background
-func (w *Watcher) Start() error {
-	// Registrar todos los directorios
-	err := filepath.Walk(w.repo, func(path string, info os.FileInfo, err error) error {
-		if err != nil || !info.IsDir() {
-			return err
-		}
-		if parser.ShouldSkipPath(path) {
-			return filepath.SkipDir
-		}
-		return w.fsw.Add(path)
-	})
+// Watch observa el directorio root y llama a indexFn/removeFn ante cambios.
+// Bloquea hasta que se cierre done.
+func Watch(root string, indexFn IndexFn, removeFn RemoveFn, done <-chan struct{}) error {
+	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
 	}
+	defer w.Close()
 
-	pending := make(map[string]time.Time)
-	ticker := time.NewTicker(300 * time.Millisecond)
+	if err := w.Add(root); err != nil {
+		return err
+	}
 
-	go func() {
-		for {
-			select {
-			case event, ok := <-w.fsw.Events:
-				if !ok {
+	log.Printf("👁️  Watching %s for changes...", root)
+
+	debounce := make(map[string]*time.Timer)
+
+	for {
+		select {
+		case <-done:
+			return nil
+
+		case event, ok := <-w.Events:
+			if !ok {
+				return nil
+			}
+			path := event.Name
+
+			// Solo procesar archivos de código
+			if !parser.IsCodeFile(path) {
+				continue
+			}
+
+			// Debounce: esperar 500ms antes de procesar
+			if t, exists := debounce[path]; exists {
+				t.Stop()
+			}
+
+			op := event.Op
+			debounce[path] = time.AfterFunc(500*time.Millisecond, func() {
+				delete(debounce, path)
+				if op&fsnotify.Remove != 0 || op&fsnotify.Rename != 0 {
+					if err := removeFn(path); err != nil {
+						log.Printf("⚠️  Failed to remove nodes for %s: %v", path, err)
+					} else {
+						log.Printf("🗑️  Removed nodes for %s", path)
+					}
 					return
 				}
-				if !parser.IsCodeFile(event.Name) {
-					continue
-				}
-				if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-					pending[event.Name] = time.Now()
-				} else if event.Op&fsnotify.Remove != 0 {
-					w.handleRemove(event.Name)
-				}
-			case <-ticker.C:
-				now := time.Now()
-				for path, t := range pending {
-					if now.Sub(t) >= 300*time.Millisecond {
-						w.handleChange(path)
-						delete(pending, path)
+				if op&(fsnotify.Create|fsnotify.Write) != 0 {
+					if err := indexFn(path); err != nil {
+						log.Printf("⚠️  Failed to reindex %s: %v", path, err)
+					} else {
+						log.Printf("🔄 Reindexed %s", path)
 					}
 				}
-			case err, ok := <-w.fsw.Errors:
-				if !ok {
-					return
-				}
-				w.logger.Printf("Watcher error: %v", err)
+			})
+
+		case err, ok := <-w.Errors:
+			if !ok {
+				return nil
 			}
+			log.Printf("⚠️  Watcher error: %v", err)
 		}
-	}()
-
-	w.logger.Printf("👁️  Watching: %s", w.repo)
-	return nil
-}
-
-// Stop detiene el watcher
-func (w *Watcher) Stop() {
-	w.fsw.Close()
-}
-
-func (w *Watcher) handleChange(path string) {
-	lang := parser.DetectLanguage(path)
-	if lang == "unknown" {
-		return
 	}
+}
+```
 
-	relPath, _ := filepath.Rel(w.repo, path)
+- [ ] **Step 2: Integrar en main.go — añadir flag `--watch` a `prism serve`**
 
-	var parsed *parser.ParsedFile
-	var err error
+Buscar el case `"serve"` en `main.go`:
+```bash
+grep -n '"serve"' main.go
+```
 
-	switch lang {
-	case "python":
-		parsed, err = parser.NewPythonParser().ParseFile(path)
-	case "typescript", "javascript":
-		parsed, err = parser.NewTypeScriptParser().ParseFile(path)
-	case "go":
-		parsed, err = parser.NewGoParser().ParseFile(path)
-	case "rust":
-		parsed, err = parser.NewRustParser().ParseFile(path)
-	case "java":
-		parsed, err = parser.NewJavaParser().ParseFile(path)
-	default:
-		return
+Añadir el flag `--watch` y arrancar el watcher si está activo. El código a añadir después de arrancar el servidor HTTP:
+```go
+// Añadir junto a los flags del subcomando serve:
+watchFlag := serveCmd.Bool("watch", false, "Auto-reindex files on change")
+
+// Añadir después de iniciar el servidor, antes del select/block:
+if *watchFlag {
+    done := make(chan struct{})
+    go func() {
+        indexFn := func(path string) error {
+            return indexSingleFile(graph, path)
+        }
+        removeFn := func(path string) error {
+            return graph.RemoveFileNodes(path)
+        }
+        if err := watcher.Watch(*repoFlag, indexFn, removeFn, done); err != nil {
+            log.Printf("⚠️  File watcher failed: %v", err)
+        }
+    }()
+}
+```
+
+Añadir el import `"github.com/ruffini/prism/watcher"` en main.go.
+
+- [ ] **Step 3: Verificar que `indexSingleFile` y `graph.RemoveFileNodes` existen**
+
+```bash
+grep -n "indexSingleFile\|RemoveFileNodes" main.go graph/builder.go
+```
+
+Si `indexSingleFile` no existe, añadirla en `main.go`:
+```go
+func indexSingleFile(g *graph.CodeGraph, filePath string) error {
+	p := parser.GetParser(filePath)
+	if p == nil {
+		return nil
 	}
-
+	parsed, err := p.ParseFile(filePath)
 	if err != nil {
-		w.logger.Printf("❌ Error parsing %s: %v", relPath, err)
-		return
+		return err
 	}
-
-	parsed.Path = relPath
-	for i := range parsed.Elements {
-		parsed.Elements[i].File = relPath
-	}
-
-	if err := w.graph.BuildFromParsed(map[string]*parser.ParsedFile{relPath: parsed}); err != nil {
-		w.logger.Printf("❌ Error indexing %s: %v", relPath, err)
-		return
-	}
-
-	w.logger.Printf("🔄 Re-indexed: %s (%d elements)", relPath, len(parsed.Elements))
-}
-
-func (w *Watcher) handleRemove(path string) {
-	relPath, _ := filepath.Rel(w.repo, path)
-	if err := w.graph.RemoveFileNodes(relPath); err != nil {
-		w.logger.Printf("❌ Error removing nodes for %s: %v", relPath, err)
-		return
-	}
-	w.logger.Printf("🗑️  Removed nodes for: %s", relPath)
+	return g.AddParsedFile(parsed)
 }
 ```
 
-- [ ] **Step 3: Añadir flag --watch al comando serve en main.go**
-
-En `main.go`, case `"serve"`, añadir el flag y activar el watcher:
+Si `RemoveFileNodes` no existe en `graph/builder.go`, añadirla:
 ```go
-case "serve":
-    serveCmd := flag.NewFlagSet("serve", flag.ExitOnError)
-    dbPath := serveCmd.String("db", "code_graph.db", "Database path")
-    vectorPath := serveCmd.String("vectors", "vectors.bin", "Vector store path")
-    ollamaURL := serveCmd.String("ollama", "http://localhost:11434", "Ollama API URL")
-    embedModel := serveCmd.String("model", "nomic-embed-text", "Embedding model name")
-    watchRepo := serveCmd.String("watch", "", "Watch directory for file changes (e.g. --watch .)")
-    serveCmd.Parse(os.Args[2:])
-
-    startMCPServer(*dbPath, *vectorPath, *ollamaURL, *embedModel, *watchRepo)
-```
-
-Actualizar la firma de `startMCPServer` y añadir el watcher:
-```go
-func startMCPServer(dbPath, vectorPath, ollamaURL, embedModel, watchRepo string) {
-    database, err := sql.Open("sqlite3", dbPath)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "❌ Failed to open database: %v\n", err)
-        os.Exit(1)
-    }
-    defer database.Close()
-
-    codeGraph := graph.NewGraph(database)
-    vectorStore := vector.NewVectorStore(database)
-    embedder := vector.NewEmbedderWithConfig(ollamaURL, embedModel)
-
-    // Start file watcher if requested
-    if watchRepo != "" {
-        logger := log.New(os.Stdout, "[WATCH] ", log.LstdFlags)
-        w, err := watcher.New(codeGraph, watchRepo, logger)
-        if err != nil {
-            fmt.Fprintf(os.Stderr, "⚠️  Failed to create watcher: %v\n", err)
-        } else {
-            if err := w.Start(); err != nil {
-                fmt.Fprintf(os.Stderr, "⚠️  Failed to start watcher: %v\n", err)
-            } else {
-                defer w.Stop()
-            }
-        }
-    }
-
-    apiServer := api.NewAPIServer(codeGraph, vectorStore, database)
-    mux := http.NewServeMux()
-    apiServer.RegisterRoutes(mux)
-
-    go func() {
-        fmt.Printf("🌐 HTTP API server listening on http://localhost:8080\n")
-        if err := http.ListenAndServe(":8080", mux); err != nil {
-            fmt.Fprintf(os.Stderr, "❌ HTTP server error: %v\n", err)
-        }
-    }()
-
-    mcpServer := mcp.NewMCPServer(codeGraph, vectorStore, embedder)
-    go func() {
-        fmt.Println("📡 MCP server ready (stdio transport)")
-        if err := mcpServer.Start(); err != nil {
-            fmt.Fprintf(os.Stderr, "⚠️  MCP connection closed\n")
-        }
-    }()
-
-    select {}
+func (g *CodeGraph) RemoveFileNodes(filePath string) error {
+	_, err := g.DB.Exec(`DELETE FROM nodes WHERE file = ?`, filePath)
+	return err
 }
-```
-
-Añadir el import de watcher en main.go:
-```go
-import (
-    // ... imports existentes ...
-    "github.com/ruffini/prism/watcher"
-)
 ```
 
 - [ ] **Step 4: Compilar**
@@ -1377,146 +1059,46 @@ go build ./...
 
 Expected: sin errores.
 
-- [ ] **Step 5: Test manual del watcher**
-
-En una terminal:
-```bash
-go run . serve --watch .
-```
-
-En otra terminal, crear un archivo de prueba:
-```bash
-echo "def hello(): pass" > /tmp/test_watch.py
-cp /tmp/test_watch.py ./test_watch.py
-sleep 1
-rm ./test_watch.py
-```
-
-Expected en la primera terminal: logs mostrando "Re-indexed: test_watch.py" y "Removed nodes for: test_watch.py"
-
-- [ ] **Step 6: Actualizar help en main.go**
-
-En `printUsage()`, añadir a la sección de opciones de `serve`:
-```
-Options for 'serve':
-  -db <path>          Path to code_graph.db (default: code_graph.db)
-  -ollama <url>       Ollama API URL (default: http://localhost:11434)
-  -model <name>       Embedding model (default: nomic-embed-text)
-  -watch <path>       Watch directory for live re-indexing (e.g. --watch .)
-```
-
-- [ ] **Step 7: Commit final**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add watcher/ graph/builder.go main.go parser/parser.go
-git commit -m "feat: add file watcher for live re-indexing (--watch flag)"
+git add watcher/watcher.go main.go graph/builder.go
+git commit -m "feat: add file watcher with 500ms debounce for auto-reindex"
 ```
 
 ---
 
-### Task 7: Test de integración completo
+### Task 8: Verificación final
 
-**Files:**
-- Modify: `tests/parser_test.go`
-
-- [ ] **Step 1: Test que verifica todos los lenguajes**
-
-Añadir a `tests/parser_test.go`:
-```go
-func TestAllParsers(t *testing.T) {
-	tests := []struct {
-		name    string
-		ext     string
-		content string
-		wantFn  string
-	}{
-		{"Go", ".go", "package main\nfunc Foo() {}", "Foo"},
-		{"Rust", ".rs", "pub fn bar() {}", "bar"},
-		{"Java", ".java", "public class A { public void baz() {} }", "A.baz"},
-		{"Python", ".py", "def qux(): pass", "qux"},
-		{"TypeScript", ".ts", "export function quux() {}", "quux"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			f, _ := os.CreateTemp("", "test_*"+tt.ext)
-			f.Write([]byte(tt.content))
-			f.Close()
-			defer os.Remove(f.Name())
-
-			lang := parser.DetectLanguage(f.Name())
-			if lang == "unknown" {
-				t.Fatalf("DetectLanguage returned unknown for %s", tt.ext)
-			}
-			if !parser.IsCodeFile(f.Name()) {
-				t.Fatalf("IsCodeFile returned false for %s", tt.ext)
-			}
-
-			var elements []parser.CodeElement
-			switch lang {
-			case "go":
-				p := parser.NewGoParser()
-				r, err := p.ParseFile(f.Name())
-				if err != nil {
-					t.Fatalf("parse error: %v", err)
-				}
-				elements = r.Elements
-			case "rust":
-				p := parser.NewRustParser()
-				r, err := p.ParseFile(f.Name())
-				if err != nil {
-					t.Fatalf("parse error: %v", err)
-				}
-				elements = r.Elements
-			case "java":
-				p := parser.NewJavaParser()
-				r, err := p.ParseFile(f.Name())
-				if err != nil {
-					t.Fatalf("parse error: %v", err)
-				}
-				elements = r.Elements
-			case "python":
-				p := parser.NewPythonParser()
-				r, err := p.ParseFile(f.Name())
-				if err != nil {
-					t.Fatalf("parse error: %v", err)
-				}
-				elements = r.Elements
-			case "typescript", "javascript":
-				p := parser.NewTypeScriptParser()
-				r, err := p.ParseFile(f.Name())
-				if err != nil {
-					t.Fatalf("parse error: %v", err)
-				}
-				elements = r.Elements
-			}
-
-			found := false
-			for _, e := range elements {
-				if e.Name == tt.wantFn {
-					found = true
-					break
-				}
-			}
-			if !found {
-				t.Errorf("expected to find %q in %s elements: %v", tt.wantFn, tt.name, elements)
-			}
-		})
-	}
-}
-```
-
-- [ ] **Step 2: Ejecutar todos los tests**
+- [ ] **Step 1: Ejecutar todos los tests**
 
 ```bash
-go test ./tests/... -v
+go test ./... -v 2>&1 | tail -30
 ```
 
-Expected: todos PASS
+Expected: PASS en los tests de parser. Los tests de integración existentes no deben romperse.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 2: Probar indexado con repo de prueba**
 
 ```bash
-git add tests/parser_test.go
-git commit -m "test: add integration tests for all language parsers"
+go run . index -repo test/sample-repo
+go run . index -repo .
+```
+
+Expected: indexa .ts y .go sin errores.
+
+- [ ] **Step 3: Verificar `go vet`**
+
+```bash
+go vet ./...
+```
+
+Expected: sin warnings.
+
+- [ ] **Step 4: Commit final si es necesario**
+
+```bash
+git add -A
+git status
+# Solo commitear si hay cambios pendientes
 ```

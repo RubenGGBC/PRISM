@@ -8,7 +8,9 @@
       "Bash(go build:*)",
       "mcp__prism__search_context",
       "mcp__prism__get_file_smart",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(go version:*)",
+      "Bash(go mod:*)"
     ]
   },
   "enableAllProjectMcpServers": true,
