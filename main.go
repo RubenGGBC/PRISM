@@ -14,6 +14,7 @@ import (
 	"github.com/ruffini/prism/api"
 	"github.com/ruffini/prism/db"
 	"github.com/ruffini/prism/graph"
+	"github.com/ruffini/prism/internal/server"
 	"github.com/ruffini/prism/mcp"
 	"github.com/ruffini/prism/parser"
 	"github.com/ruffini/prism/vector"
@@ -27,6 +28,18 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "start":
+		startCmd := flag.NewFlagSet("start", flag.ExitOnError)
+		repoPath := startCmd.String("repo", ".", "Repository path to index")
+		port := startCmd.Int("port", 8080, "HTTP server port")
+		mcpOnly := startCmd.Bool("mcp-only", false, "Only start MCP server (no web UI)")
+		autoIndex := startCmd.Bool("auto-index", true, "Automatically index if database doesn't exist")
+		ollamaURL := startCmd.String("ollama", "http://localhost:11434", "Ollama API URL")
+		embedModel := startCmd.String("model", "nomic-embed-text", "Embedding model name")
+		startCmd.Parse(os.Args[2:])
+
+		startUnified(*repoPath, *port, *mcpOnly, *autoIndex, *ollamaURL, *embedModel)
+
 	case "parse":
 		parseCmd := flag.NewFlagSet("parse", flag.ExitOnError)
 		jsonOutput := parseCmd.Bool("json", false, "Output as JSON")
@@ -105,12 +118,21 @@ Usage:
   prism <command> [options]
 
 Commands:
+  start                Start unified server (auto-index, embed, serve all-in-one)
   parse <file>         Parse a single file and show extracted elements
   index                Index the current directory (or use -repo <path> for specific directory)
   embed                Generate embeddings for indexed code
   search <query>       Semantic search for code elements
   serve                Start MCP server for Claude Code integration
   help                 Show this help
+
+Options for 'start' (RECOMMENDED):
+  -repo <path>        Repository path to index (default: current directory)
+  -port <number>      HTTP server port (default: 8080)
+  -mcp-only           Only start MCP server via stdio (no web UI)
+  -auto-index         Automatically index if needed (default: true)
+  -ollama <url>       Ollama API URL (default: http://localhost:11434)
+  -model <name>       Embedding model (default: nomic-embed-text)
 
 Options for 'parse':
   -json               Output as JSON
@@ -139,13 +161,20 @@ Options for 'export':
   -output <path>      Output file (default: CLAUDE.md)
 
 Examples:
+  # Quick start - everything automated!
+  prism start
+
+  # Start with custom repo and port
+  prism start -repo ./my-project -port 9000
+
+  # For Claude Code MCP integration (stdio only)
+  prism start -mcp-only -auto-index
+
+  # Manual workflow (advanced users)
   prism parse main.py
-  prism parse -json auth/login.py
-  prism index
   prism index -repo ./my-project
   prism embed -db code_graph.db
-  prism search "user authentication"
-  prism serve -db ./my-project/code_graph.db`)
+  prism serve -db code_graph.db`)
 }
 
 func parseFile(filePath string, jsonOutput bool) {
@@ -635,4 +664,194 @@ func exportClaudeMD(dbPath, outputPath string) {
 		os.Exit(1)
 	}
 	fmt.Printf("✅ Exported to %s\n", outputPath)
+}
+
+func startUnified(repoPath string, port int, mcpOnly, autoIndex bool, ollamaURL, embedModel string) {
+	fmt.Fprintln(os.Stderr, "🔮 PRISM - Starting Unified Server")
+	
+	// Determine database path (use .prism folder in repo)
+	prismDir := filepath.Join(repoPath, ".prism")
+	if err := os.MkdirAll(prismDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to create .prism directory: %v\n", err)
+		os.Exit(1)
+	}
+	
+	dbPath := filepath.Join(prismDir, "code_graph.db")
+	dbExists := fileExists(dbPath)
+	
+	// Auto-index if database doesn't exist and auto-index is enabled
+	if !dbExists && autoIndex {
+		fmt.Fprintf(os.Stderr, "📦 First time setup - indexing repository...\n")
+		fmt.Fprintf(os.Stderr, "   Repository: %s\n", repoPath)
+		
+		// Initialize database
+		database, err := db.InitDB(dbPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Failed to initialize database: %v\n", err)
+			os.Exit(1)
+		}
+		
+		// Index the repository
+		codeGraph := graph.NewGraph(database)
+		if err := indexRepositoryToGraph(repoPath, codeGraph); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Failed to index repository: %v\n", err)
+			database.Close()
+			os.Exit(1)
+		}
+		
+		// Generate embeddings in background
+		fmt.Fprintf(os.Stderr, "🧠 Generating embeddings in background...\n")
+		go generateEmbeddingsForDB(database, ollamaURL, embedModel)
+		
+		database.Close()
+		fmt.Fprintf(os.Stderr, "✅ Repository indexed successfully\n")
+	} else if !dbExists {
+		fmt.Fprintf(os.Stderr, "⚠️  No index found. Run with --auto-index or run 'prism index' first.\n")
+		os.Exit(1)
+	} else {
+		fmt.Fprintf(os.Stderr, "✅ Using existing index: %s\n", dbPath)
+	}
+	
+	// Open database
+	database, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to open database: %v\n", err)
+		os.Exit(1)
+	}
+	defer database.Close()
+	
+	// Start unified server
+	srv := server.NewUnifiedServer(database, port, ollamaURL, embedModel, mcpOnly || !isTerminal())
+	if err := srv.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Server failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func indexRepositoryToGraph(repoPath string, codeGraph *graph.CodeGraph) error {
+	parsedFiles := make(map[string]*parser.ParsedFile)
+	totalFiles := 0
+
+	err := filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			if parser.ShouldSkipPath(path) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if !parser.IsCodeFile(path) {
+			return nil
+		}
+
+		p := parser.GetParser(path)
+		if p == nil {
+			return nil
+		}
+
+		relPath, _ := filepath.Rel(repoPath, path)
+		parsed, err := p.ParseFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠ Error parsing %s: %v\n", relPath, err)
+			return nil
+		}
+
+		parsed.Path = relPath
+		for i := range parsed.Elements {
+			parsed.Elements[i].File = relPath
+		}
+		parsedFiles[relPath] = parsed
+		totalFiles++
+		
+		if totalFiles%10 == 0 {
+			fmt.Fprintf(os.Stderr, "  📄 Indexed %d files...\n", totalFiles)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "  ✓ Parsed %d files\n", totalFiles)
+
+	// Build graph
+	if err := codeGraph.BuildFromParsed(parsedFiles); err != nil {
+		return err
+	}
+
+	// Resolve call edges
+	if err := codeGraph.ResolveCallEdges(); err != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠ Warning: Failed to resolve call edges: %v\n", err)
+	}
+
+	return nil
+}
+
+func generateEmbeddingsForDB(database *sql.DB, ollamaURL, model string) {
+	// Initialize vector store
+	store := vector.NewVectorStore(database)
+	if err := store.InitSchema(); err != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠ Failed to init vector store: %v\n", err)
+		return
+	}
+
+	embedder := vector.NewEmbedderWithConfig(ollamaURL, model)
+
+	// Get nodes to embed
+	rows, err := database.Query(`SELECT id, name, type, file, signature, docstring FROM nodes`)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠ Failed to query nodes: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	embedded := 0
+	for rows.Next() {
+		var id, name, nodeType, file string
+		var sig, doc sql.NullString
+		if err := rows.Scan(&id, &name, &nodeType, &file, &sig, &doc); err != nil {
+			continue
+		}
+
+		text := fmt.Sprintf("%s %s in %s", nodeType, name, file)
+		if sig.Valid {
+			text += "\n" + sig.String
+		}
+		if doc.Valid {
+			text += "\n" + doc.String
+		}
+
+		embedding, err := embedder.Embed(text)
+		if err != nil {
+			continue
+		}
+
+		if err := store.Store(id, embedding); err != nil {
+			continue
+		}
+
+		embedded++
+		if embedded%50 == 0 {
+			fmt.Fprintf(os.Stderr, "  🧠 Embedded %d nodes...\n", embedded)
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "  ✅ Embedding complete (%d nodes)\n", embedded)
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func isTerminal() bool {
+	// Check if running in a terminal (simple heuristic)
+	stat, _ := os.Stdin.Stat()
+	return (stat.Mode() & os.ModeCharDevice) != 0
 }
