@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -174,6 +175,18 @@ func (m *MCPServer) registerTools() {
 		),
 		m.handleSearchDocs,
 	)
+
+	// Tool 7: use_profile
+	m.server.AddTool(
+		mcp.NewTool("use_profile",
+			mcp.WithDescription("Load a named context profile — returns all nodes in the profile with their annotations. Use before starting work on a specific area."),
+			mcp.WithString("name",
+				mcp.Required(),
+				mcp.Description("Profile name (e.g. 'auth', 'checkout', 'frontend')"),
+			),
+		),
+		m.handleUseProfile,
+	)
 }
 
 // handleSearchContext handles the search_context tool
@@ -265,8 +278,18 @@ func (m *MCPServer) handleSearchContext(ctx context.Context, request mcp.CallToo
 		savingsPercent = (float64(tokenSavings) / float64(tokensWithoutMCP)) * 100
 	}
 	
-	m.logger.Printf("✅ search_context: found %d results (keyword) in %v | %d tokens (saved ~%d tokens, %.0f%%)", 
+	m.logger.Printf("✅ search_context: found %d results (keyword) in %v | %d tokens (saved ~%d tokens, %.0f%%)",
 		len(nodes), elapsed, totalTokens, tokenSavings, savingsPercent)
+
+	// Track tokens served vs tokens that would have been needed reading full files
+	m.graph.DB.Exec(`
+		INSERT INTO mcp_sessions (id, tokens_served, tokens_saved)
+		VALUES (?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			tokens_served = tokens_served + excluded.tokens_served,
+			tokens_saved = tokens_saved + excluded.tokens_saved`,
+		"current_session", totalTokens, tokenSavings)
+
 	return formatNodesResult(nodes), nil
 }
 
@@ -783,6 +806,86 @@ func discoverDefaultMdFiles() []string {
 	}
 
 	return files
+}
+
+// formatNodeWithAnnotations formats a single node with its annotations from the DB
+func (m *MCPServer) formatNodeWithAnnotations(id, name, nType, file string, line int, sig, doc string) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("### %s (%s)\n", name, nType))
+	sb.WriteString(fmt.Sprintf("**File:** %s:%d\n", file, line))
+	if sig != "" {
+		sb.WriteString(fmt.Sprintf("**Signature:** `%s`\n", sig))
+	}
+	if doc != "" {
+		sb.WriteString(fmt.Sprintf("**Doc:** %s\n", doc))
+	}
+
+	// Load annotations from DB
+	annotations, err := m.graph.GetNodeAnnotations(id)
+	if err == nil && len(annotations) > 0 {
+		if comment, ok := annotations["comments"].(string); ok && comment != "" {
+			sb.WriteString(fmt.Sprintf("**Comment:** %s\n", comment))
+		}
+		if tags, ok := annotations["tags"].([]string); ok && len(tags) > 0 {
+			sb.WriteString(fmt.Sprintf("**Tags:** %v\n", tags))
+		}
+	}
+	return sb.String()
+}
+
+// handleUseProfile handles the use_profile tool
+func (m *MCPServer) handleUseProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, ok := req.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments"), nil
+	}
+	name, _ := args["name"].(string)
+	if name == "" {
+		return mcp.NewToolResultError("profile name is required"), nil
+	}
+
+	// Find profile by name
+	var profileID string
+	err := m.graph.DB.QueryRow(`SELECT id FROM profiles WHERE name = ?`, name).Scan(&profileID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("profile '%s' not found", name)), nil
+	}
+
+	// Get nodes in profile
+	rows, err := m.graph.DB.Query(`
+		SELECT n.id, n.name, n.type, n.file, n.line, n.signature, n.docstring
+		FROM profile_nodes pn
+		JOIN nodes n ON n.id = pn.node_id
+		WHERE pn.profile_id = ?`, profileID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("query error: %v", err)), nil
+	}
+	defer rows.Close()
+
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("# Context Profile: %s\n\n", name))
+
+	count := 0
+	totalTokens := 0
+	for rows.Next() {
+		var id, nName, nType, file string
+		var line int
+		var sigNull, docNull sql.NullString
+		rows.Scan(&id, &nName, &nType, &file, &line, &sigNull, &docNull)
+
+		entry := m.formatNodeWithAnnotations(id, nName, nType, file, line, sigNull.String, docNull.String)
+		result.WriteString(entry)
+		result.WriteString("\n")
+		count++
+		totalTokens += m.countTokens(entry)
+	}
+
+	if count == 0 {
+		return mcp.NewToolResultError(fmt.Sprintf("profile '%s' has no nodes. Add nodes via the UI.", name)), nil
+	}
+
+	m.logger.Printf("📦 Profile '%s': %d nodes, ~%d tokens", name, count, totalTokens)
+	return mcp.NewToolResultText(result.String()), nil
 }
 
 // formatNodesResult formats a list of nodes
