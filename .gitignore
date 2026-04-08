@@ -92,3 +92,6 @@ claude_desktop_config.json
 # Local development
 .local/
 .tmp/
+
+# Git worktrees
+.worktrees/
