@@ -479,7 +479,7 @@ func generateEmbeddings(dbPath, ollamaURL, model string) {
 
 	// Get all nodes from database
 	rows, err := database.Query(`
-		SELECT id, name, type, file, line, end_line, signature, docstring 
+		SELECT id, name, type, file, line, end_line, signature, docstring, body
 		FROM nodes
 	`)
 	if err != nil {
@@ -497,6 +497,7 @@ func generateEmbeddings(dbPath, ollamaURL, model string) {
 		EndLine   int
 		Signature string
 		Docstring string
+		Body      string
 	}
 
 	for rows.Next() {
@@ -509,13 +510,15 @@ func generateEmbeddings(dbPath, ollamaURL, model string) {
 			EndLine   int
 			Signature string
 			Docstring string
+			Body      string
 		}
-		var sig, doc sql.NullString
-		if err := rows.Scan(&n.ID, &n.Name, &n.Type, &n.File, &n.Line, &n.EndLine, &sig, &doc); err != nil {
+		var sig, doc, body sql.NullString
+		if err := rows.Scan(&n.ID, &n.Name, &n.Type, &n.File, &n.Line, &n.EndLine, &sig, &doc, &body); err != nil {
 			continue
 		}
 		n.Signature = sig.String
 		n.Docstring = doc.String
+		n.Body = body.String
 		nodes = append(nodes, n)
 	}
 
@@ -546,13 +549,7 @@ func generateEmbeddings(dbPath, ollamaURL, model string) {
 		}
 
 		// Create text representation for embedding
-		text := fmt.Sprintf("%s %s in %s", n.Type, n.Name, n.File)
-		if n.Signature != "" {
-			text += "\n" + n.Signature
-		}
-		if n.Docstring != "" {
-			text += "\n" + n.Docstring
-		}
+		text := vector.BuildEmbedText(n.Name, n.Type, n.Signature, n.Docstring, n.Body)
 
 		// Generate embedding
 		embedding, err := embedder.Embed(text)
@@ -831,7 +828,7 @@ func generateEmbeddingsForDB(database *sql.DB, ollamaURL, model string) {
 	embedder := vector.NewEmbedderWithConfig(ollamaURL, model)
 
 	// Get nodes to embed
-	rows, err := database.Query(`SELECT id, name, type, file, signature, docstring FROM nodes`)
+	rows, err := database.Query(`SELECT id, name, type, file, signature, docstring, body FROM nodes`)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  ⚠ Failed to query nodes: %v\n", err)
 		return
@@ -841,18 +838,12 @@ func generateEmbeddingsForDB(database *sql.DB, ollamaURL, model string) {
 	embedded := 0
 	for rows.Next() {
 		var id, name, nodeType, file string
-		var sig, doc sql.NullString
-		if err := rows.Scan(&id, &name, &nodeType, &file, &sig, &doc); err != nil {
+		var sig, doc, body sql.NullString
+		if err := rows.Scan(&id, &name, &nodeType, &file, &sig, &doc, &body); err != nil {
 			continue
 		}
 
-		text := fmt.Sprintf("%s %s in %s", nodeType, name, file)
-		if sig.Valid {
-			text += "\n" + sig.String
-		}
-		if doc.Valid {
-			text += "\n" + doc.String
-		}
+		text := vector.BuildEmbedText(name, nodeType, sig.String, doc.String, body.String)
 
 		embedding, err := embedder.Embed(text)
 		if err != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 // Embedder generates vector embeddings using Ollama API
@@ -88,6 +89,36 @@ func (e *Embedder) EmbedBatch(texts []string) ([][]float32, error) {
 	}
 
 	return result.Embeddings, nil
+}
+
+// BuildEmbedText builds a richer text representation of a code element for embedding.
+// Includes type, name, signature, docstring excerpt, and body context for better semantic search.
+func BuildEmbedText(name, nodeType, signature, docstring, body string) string {
+	parts := []string{}
+	if nodeType != "" {
+		parts = append(parts, nodeType)
+	}
+	if name != "" {
+		parts = append(parts, name)
+	}
+	if signature != "" {
+		parts = append(parts, signature)
+	}
+	if docstring != "" {
+		doc := docstring
+		if len(doc) > 200 {
+			doc = doc[:200]
+		}
+		parts = append(parts, doc)
+	}
+	if body != "" {
+		lines := strings.SplitN(body, "\n", 4)
+		if len(lines) > 3 {
+			lines = lines[:3]
+		}
+		parts = append(parts, strings.Join(lines, " "))
+	}
+	return strings.Join(parts, " | ")
 }
 
 // Dimension returns the expected embedding dimension for the model
