@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -16,6 +15,7 @@ import (
 	"github.com/ruffini/prism/graph"
 	"github.com/ruffini/prism/internal/models"
 	"github.com/ruffini/prism/mdchunker"
+	"github.com/ruffini/prism/parser"
 	"github.com/ruffini/prism/vector"
 )
 
@@ -127,10 +127,16 @@ func (m *MCPServer) registerTools() {
 	// Tool 3: trace_impact
 	m.server.AddTool(
 		mcp.NewTool("trace_impact",
-			mcp.WithDescription("Show the blast radius - what functions would be affected if you change this one. Returns direct callers and transitive callers."),
+			mcp.WithDescription("Analyze the impact of changing a function. Shows callers (upstream) and/or callees (downstream) up to a configurable depth."),
 			mcp.WithString("function_id",
 				mcp.Required(),
-				mcp.Description("The function ID to analyze (format: file.py:function_name)"),
+				mcp.Description("The function ID (e.g. 'src/auth.go:Login')"),
+			),
+			mcp.WithString("direction",
+				mcp.Description("'upstream' (who calls this), 'downstream' (what this calls), or 'both' (default: upstream)"),
+			),
+			mcp.WithNumber("depth",
+				mcp.Description("How many levels deep to traverse (default: 3, max: 5)"),
 			),
 		),
 		m.handleTraceImpact,
@@ -139,13 +145,12 @@ func (m *MCPServer) registerTools() {
 	// Tool 4: list_functions
 	m.server.AddTool(
 		mcp.NewTool("list_functions",
-			mcp.WithDescription("List all functions in a file or matching a search pattern."),
-			mcp.WithString("file",
-				mcp.Description("Optional: filter by file path"),
-			),
-			mcp.WithString("pattern",
-				mcp.Description("Optional: filter by name pattern (substring match)"),
-			),
+			mcp.WithDescription("List functions, methods, and classes. Supports pagination, type filter, and file filter."),
+			mcp.WithString("file", mcp.Description("Filter by file path")),
+			mcp.WithString("pattern", mcp.Description("Filter by name pattern")),
+			mcp.WithString("type", mcp.Description("Filter by type: function, method, class")),
+			mcp.WithNumber("limit", mcp.Description("Max results per page (default: 50)")),
+			mcp.WithNumber("offset", mcp.Description("Pagination offset (default: 0)")),
 		),
 		m.handleListFunctions,
 	)
@@ -186,6 +191,24 @@ func (m *MCPServer) registerTools() {
 			),
 		),
 		m.handleUseProfile,
+	)
+
+	// Tool 8: find_similar
+	m.server.AddTool(
+		mcp.NewTool("find_similar",
+			mcp.WithDescription("Find functions with similar implementation to the given function. Useful for detecting near-duplicates and refactoring candidates."),
+			mcp.WithString("function_id",
+				mcp.Required(),
+				mcp.Description("The function ID to find similar functions for (e.g. 'src/auth.go:validateForm')"),
+			),
+			mcp.WithNumber("limit",
+				mcp.Description("Max similar functions to return (default: 5)"),
+			),
+			mcp.WithNumber("threshold",
+				mcp.Description("Minimum similarity score 0.0-1.0 (default: 0.75)"),
+			),
+		),
+		m.handleFindSimilar,
 	)
 }
 
@@ -265,7 +288,7 @@ func (m *MCPServer) handleSearchContext(ctx context.Context, request mcp.CallToo
 	}
 
 	elapsed := time.Since(start)
-	
+
 	// Count tokens in results
 	totalTokens := 0
 	for _, node := range nodes {
@@ -277,7 +300,7 @@ func (m *MCPServer) handleSearchContext(ctx context.Context, request mcp.CallToo
 	if tokensWithoutMCP > 0 {
 		savingsPercent = (float64(tokenSavings) / float64(tokensWithoutMCP)) * 100
 	}
-	
+
 	m.logger.Printf("✅ search_context: found %d results (keyword) in %v | %d tokens (saved ~%d tokens, %.0f%%)",
 		len(nodes), elapsed, totalTokens, tokenSavings, savingsPercent)
 
@@ -316,24 +339,32 @@ func (m *MCPServer) handleGetFileSmart(ctx context.Context, request mcp.CallTool
 
 	m.logger.Printf("📄 get_file_smart called: file='%s', symbol='%s'", file, symbol)
 
-	// Get all nodes in the file
-	nodes, err := m.graph.GetNodesByFile(file)
+	// Get all nodes in the file (supports slash/backslash and absolute path variants)
+	nodes, err := m.graph.GetNodesByFileFlexible(file)
 	if err != nil {
 		m.logger.Printf("❌ get_file_smart: error retrieving file: %v", err)
 		return mcp.NewToolResultError(fmt.Sprintf("error retrieving file: %v", err)), nil
 	}
+	if len(nodes) == 0 {
+		m.logger.Printf("❌ get_file_smart: file not found in index")
+		return mcp.NewToolResultError(fmt.Sprintf("file '%s' not found in index", file)), nil
+	}
 
 	// Find the matching symbol
-	var node *models.GraphNode
-	for i := range nodes {
-		if nodes[i].Name == symbol {
-			node = &nodes[i]
-			break
-		}
-	}
+	node := findNodeBySymbol(nodes, symbol)
 
 	if node == nil {
 		m.logger.Printf("❌ get_file_smart: symbol not found")
+		suggestions := make([]string, 0, min(6, len(nodes)))
+		for i := 0; i < len(nodes) && i < 6; i++ {
+			suggestions = append(suggestions, nodes[i].Name)
+		}
+		if len(suggestions) > 0 {
+			return mcp.NewToolResultError(
+				fmt.Sprintf("symbol '%s' not found in file '%s'. Try one of: %s",
+					symbol, nodes[0].File, strings.Join(suggestions, ", ")),
+			), nil
+		}
 		return mcp.NewToolResultError(fmt.Sprintf("symbol '%s' not found in file '%s'", symbol, file)), nil
 	}
 
@@ -436,61 +467,77 @@ func (m *MCPServer) handleTraceImpact(ctx context.Context, request mcp.CallToolR
 	start := time.Now()
 	args, ok := request.Params.Arguments.(map[string]interface{})
 	if !ok {
-		m.logger.Println("❌ trace_impact: invalid arguments")
 		return mcp.NewToolResultError("invalid arguments"), nil
 	}
 
 	functionID, ok := args["function_id"].(string)
 	if !ok || functionID == "" {
-		m.logger.Println("❌ trace_impact: missing function_id parameter")
 		return mcp.NewToolResultError("function_id parameter is required"), nil
 	}
 
-	m.logger.Printf("🎯 trace_impact called: function_id='%s'", functionID)
-
-	// Get the node
-	node, err := m.graph.GetNode(functionID)
-	if err != nil {
-		m.logger.Printf("❌ trace_impact: error getting node: %v", err)
-		return mcp.NewToolResultError(fmt.Sprintf("error: %v", err)), nil
+	direction := "upstream"
+	if d, ok := args["direction"].(string); ok && d != "" {
+		direction = d
 	}
 
+	depth := 3
+	if d, ok := args["depth"].(float64); ok && d > 0 {
+		depth = int(d)
+		if depth > 5 {
+			depth = 5
+		}
+	}
+
+	m.logger.Printf("🎯 trace_impact: function_id='%s' direction='%s' depth=%d", functionID, direction, depth)
+
+	node, err := m.graph.GetNode(functionID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("error: %v", err)), nil
+	}
 	if node == nil {
-		m.logger.Printf("❌ trace_impact: node not found")
 		return mcp.NewToolResultError(fmt.Sprintf("function '%s' not found", functionID)), nil
 	}
 
-	// Get direct callers
-	directCallers, _ := m.graph.GetCallers(functionID)
+	result := fmt.Sprintf("## Impact Analysis: %s\n\n", node.Name)
 
-	// Get transitive callers (up to 3 levels)
-	allCallers := make(map[string]bool)
-	for _, caller := range directCallers {
-		allCallers[caller] = true
-		level2, _ := m.graph.GetCallers(caller)
-		for _, l2 := range level2 {
-			allCallers[l2] = true
-			level3, _ := m.graph.GetCallers(l2)
-			for _, l3 := range level3 {
-				allCallers[l3] = true
+	if direction == "upstream" || direction == "both" {
+		directCallers, _ := m.graph.GetCallers(functionID)
+		allCallers := make(map[string]bool)
+		queue := make([]string, len(directCallers))
+		copy(queue, directCallers)
+		for d := 0; d < depth && len(queue) > 0; d++ {
+			next := []string{}
+			for _, caller := range queue {
+				if !allCallers[caller] {
+					allCallers[caller] = true
+					lvl, _ := m.graph.GetCallers(caller)
+					next = append(next, lvl...)
+				}
 			}
+			queue = next
 		}
+		result += fmt.Sprintf("### Upstream (callers) — %d direct, %d total\n", len(directCallers), len(allCallers))
+		for _, c := range directCallers {
+			result += fmt.Sprintf("- %s\n", c)
+		}
+		result += "\n"
+	}
+
+	if direction == "downstream" || direction == "both" {
+		directCallees, _ := m.graph.GetCallees(functionID)
+		allCallees, err := m.graph.GetCalleesTransitive(functionID, depth)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("error getting callees: %v", err)), nil
+		}
+		result += fmt.Sprintf("### Downstream (callees) — %d direct, %d total\n", len(directCallees), len(allCallees))
+		for _, c := range directCallees {
+			result += fmt.Sprintf("- %s\n", c)
+		}
+		result += "\n"
 	}
 
 	elapsed := time.Since(start)
-	m.logger.Printf("✅ trace_impact: found %d direct callers, %d total affected in %v", len(directCallers), len(allCallers), elapsed)
-
-	result := fmt.Sprintf("## Impact Analysis: %s\n\n", node.Name)
-	result += fmt.Sprintf("**Direct callers:** %d\n", len(directCallers))
-	result += fmt.Sprintf("**Total affected (up to 3 levels):** %d\n\n", len(allCallers))
-
-	if len(directCallers) > 0 {
-		result += "**Direct callers:**\n"
-		for _, caller := range directCallers {
-			result += fmt.Sprintf("- %s\n", caller)
-		}
-	}
-
+	m.logger.Printf("✅ trace_impact: done in %v", elapsed)
 	return mcp.NewToolResultText(result), nil
 }
 
@@ -504,8 +551,18 @@ func (m *MCPServer) handleListFunctions(ctx context.Context, request mcp.CallToo
 
 	file, _ := args["file"].(string)
 	pattern, _ := args["pattern"].(string)
+	nodeType, _ := args["type"].(string)
 
-	m.logger.Printf("📋 list_functions called: file='%s', pattern='%s'", file, pattern)
+	limit := 50
+	if l, ok := args["limit"].(float64); ok && l > 0 {
+		limit = int(l)
+	}
+	offset := 0
+	if o, ok := args["offset"].(float64); ok && o >= 0 {
+		offset = int(o)
+	}
+
+	m.logger.Printf("📋 list_functions: file='%s' pattern='%s' type='%s' limit=%d offset=%d", file, pattern, nodeType, limit, offset)
 
 	var nodes []models.GraphNode
 	var err error
@@ -515,31 +572,26 @@ func (m *MCPServer) handleListFunctions(ctx context.Context, request mcp.CallToo
 	} else if pattern != "" {
 		nodes, err = m.graph.SearchByName(pattern)
 	} else {
-		nodes, err = m.graph.GetAllNodes(100)
+		nodes, err = m.graph.GetAllNodesPaginated(limit, offset, nodeType)
 	}
 
 	if err != nil {
-		m.logger.Printf("❌ list_functions: error: %v", err)
 		return mcp.NewToolResultError(fmt.Sprintf("error: %v", err)), nil
 	}
 
-	elapsed := time.Since(start)
-	
-	// Count tokens
-	totalTokens := 0
-	for _, node := range nodes {
-		totalTokens += m.countTokens(node.Name + " " + node.Signature)
+	// Apply type filter post-query when file or pattern was used
+	if nodeType != "" && (file != "" || pattern != "") {
+		filtered := nodes[:0]
+		for _, n := range nodes {
+			if n.Type == nodeType {
+				filtered = append(filtered, n)
+			}
+		}
+		nodes = filtered
 	}
-	tokensWithoutMCP := len(nodes) * 500 // would need more context per file
-	tokenSavings := tokensWithoutMCP - totalTokens
-	savingsPercent := 0.0
-	if tokensWithoutMCP > 0 {
-		savingsPercent = (float64(tokenSavings) / float64(tokensWithoutMCP)) * 100
-	}
-	
-	m.logger.Printf("✅ list_functions: found %d functions in %v | %d tokens (saved ~%d tokens, %.0f%%)", 
-		len(nodes), elapsed, totalTokens, tokenSavings, savingsPercent)
 
+	elapsed := time.Since(start)
+	m.logger.Printf("✅ list_functions: %d results in %v", len(nodes), elapsed)
 	return formatNodesResult(nodes), nil
 }
 
@@ -654,10 +706,64 @@ func (m *MCPServer) handleIndexDocs(ctx context.Context, request mcp.CallToolReq
 		m.logger.Printf("  ✓ %s (%d chunks)", relPath, len(chunks))
 	}
 
+	// Also index inline comments and JSDoc from source files
+	codeRoot := "."
+	if customPath != "" {
+		codeRoot = customPath
+	}
+	codeFilesIndexed := 0
+	filepath.Walk(codeRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if parser.ShouldSkipPath(path) || !parser.IsCodeFile(path) {
+			return nil
+		}
+		source, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		comments := extractCodeComments(source)
+		if len(strings.TrimSpace(comments)) < 20 {
+			return nil
+		}
+		relPath := path
+		if abs, err2 := filepath.Abs(path); err2 == nil {
+			if cwd, err3 := os.Getwd(); err3 == nil {
+				if rel, err4 := filepath.Rel(cwd, abs); err4 == nil {
+					relPath = filepath.ToSlash(rel)
+				}
+			}
+		}
+		docID := "comments:" + relPath
+		chunks := mdchunker.ChunkText(comments, docID)
+		if len(chunks) == 0 {
+			return nil
+		}
+		embedTexts := make([]string, len(chunks))
+		for i, c := range chunks {
+			embedTexts[i] = c.Content
+		}
+		embeddings, err := m.embedder.EmbedBatch(embedTexts)
+		if err != nil {
+			return nil
+		}
+		m.docStore.DeleteChunksForFile(docID)
+		for i, chunk := range chunks {
+			m.docStore.StoreChunk(chunk.ID, chunk.File, chunk.ChunkIndex, chunk.LineStart, chunk.Content)
+			if i < len(embeddings) {
+				m.vector.Store(fmt.Sprintf("%s#%d", docID, i), embeddings[i])
+			}
+		}
+		codeFilesIndexed++
+		return nil
+	})
+
 	elapsed := time.Since(start)
 	result := fmt.Sprintf("## index_docs complete (%v)\n\n", elapsed)
 	result += fmt.Sprintf("- Files indexed: **%d**\n", totalFiles)
 	result += fmt.Sprintf("- Chunks created: **%d**\n", totalChunks)
+	result += fmt.Sprintf("- Source files (comments): **%d**\n", codeFilesIndexed)
 	if len(errors) > 0 {
 		result += fmt.Sprintf("\n**Errors (%d):**\n", len(errors))
 		for _, e := range errors {
@@ -665,8 +771,44 @@ func (m *MCPServer) handleIndexDocs(ctx context.Context, request mcp.CallToolReq
 		}
 	}
 
-	m.logger.Printf("✅ index_docs: %d files, %d chunks in %v", totalFiles, totalChunks, elapsed)
+	m.logger.Printf("✅ index_docs: %d files, %d chunks in %v, %d source files (comments)", totalFiles, totalChunks, elapsed, codeFilesIndexed)
 	return mcp.NewToolResultText(result), nil
+}
+
+// extractCodeComments extracts line and block comments from source code
+func extractCodeComments(source []byte) string {
+	content := string(source)
+	var comments []string
+	lines := strings.Split(content, "\n")
+	inBlock := false
+	var blockLines []string
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if inBlock {
+			blockLines = append(blockLines, trimmed)
+			if strings.Contains(trimmed, "*/") {
+				inBlock = false
+				comments = append(comments, strings.Join(blockLines, " "))
+				blockLines = nil
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "/*") {
+			inBlock = true
+			blockLines = []string{trimmed}
+			if strings.Contains(trimmed, "*/") {
+				inBlock = false
+				comments = append(comments, trimmed)
+				blockLines = nil
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "//") {
+			comments = append(comments, strings.TrimPrefix(trimmed, "//"))
+		}
+	}
+	return strings.Join(comments, "\n")
 }
 
 // handleSearchDocs handles the search_docs tool
@@ -826,23 +968,8 @@ func (m *MCPServer) formatNodeWithAnnotations(nodeID, name, nodeType, file strin
 	return sb.String()
 }
 
-// handleUseProfile handles the use_profile MCP tool
-func (m *MCPServer) handleUseProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	args, ok := req.Params.Arguments.(map[string]interface{})
-	if !ok {
-		return mcp.NewToolResultError("invalid arguments"), nil
-	}
-	name, _ := args["name"].(string)
-	if name == "" {
-		return mcp.NewToolResultError("profile name is required"), nil
-	}
-
-	var profileID string
-	err := m.graph.DB.QueryRow(`SELECT id FROM profiles WHERE name = ?`, name).Scan(&profileID)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("profile '%s' not found", name)), nil
-	}
-
+// loadStoredProfile loads a profile by ID and returns its formatted content
+func (m *MCPServer) loadStoredProfile(profileID, name string) (*mcp.CallToolResult, error) {
 	rows, err := m.graph.DB.Query(`
 		SELECT n.id, n.name, n.type, n.file, n.line, n.signature, n.docstring
 		FROM profile_nodes pn
@@ -859,25 +986,232 @@ func (m *MCPServer) handleUseProfile(ctx context.Context, req mcp.CallToolReques
 	count := 0
 	totalTokens := 0
 	for rows.Next() {
-		var id, nName, nType, file string
+		var id, nName, nType, file, signature, docstring string
 		var line int
-		var sigNull, docNull sql.NullString
-		rows.Scan(&id, &nName, &nType, &file, &line, &sigNull, &docNull)
-
-		entry := m.formatNodeWithAnnotations(id, nName, nType, file, line, sigNull.String, docNull.String)
-		result.WriteString(entry)
-		result.WriteString("\n")
+		if err := rows.Scan(&id, &nName, &nType, &file, &line, &signature, &docstring); err != nil {
+			continue
+		}
+		result.WriteString(m.formatNodeWithAnnotations(id, nName, nType, file, line, signature, docstring))
+		totalTokens += m.countTokens(signature + " " + docstring)
 		count++
-		totalTokens += m.countTokens(entry)
+	}
+
+	result.WriteString(fmt.Sprintf("\n---\n*%d functions, ~%d tokens*\n", count, totalTokens))
+	return mcp.NewToolResultText(result.String()), nil
+}
+
+// handleUseProfile handles the use_profile MCP tool
+func (m *MCPServer) handleUseProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, ok := req.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments"), nil
+	}
+	name, _ := args["name"].(string)
+	if name == "" {
+		return mcp.NewToolResultError("profile name is required"), nil
+	}
+
+	// Try stored profile
+	var profileID string
+	err := m.graph.DB.QueryRow(`SELECT id FROM profiles WHERE name = ?`, name).Scan(&profileID)
+	if err == nil {
+		return m.loadStoredProfile(profileID, name)
+	}
+
+	// Try auto-generating from directory clustering
+	dirs, _ := m.graph.GetDistinctDirectories()
+	for _, dir := range dirs {
+		if strings.EqualFold(dir, name) {
+			nodes, err := m.graph.GetNodesByDirectoryPrefix(dir, 30)
+			if err != nil || len(nodes) == 0 {
+				break
+			}
+			var result strings.Builder
+			result.WriteString(fmt.Sprintf("# Auto-generated Profile: %s\n\n", name))
+			result.WriteString(fmt.Sprintf("*Inferred from directory `%s/` — top %d functions by PageRank*\n\n", dir, len(nodes)))
+			for _, n := range nodes {
+				result.WriteString(m.formatNodeWithAnnotations(n.ID, n.Name, n.Type, n.File, n.Line, n.Signature, ""))
+			}
+			return mcp.NewToolResultText(result.String()), nil
+		}
+	}
+
+	// Not found — suggest alternatives
+	storedNames, _ := m.graph.ListProfileNames()
+	suggestion := fmt.Sprintf("Profile '%s' not found.\n\n", name)
+	if len(storedNames) > 0 {
+		suggestion += "**Stored profiles:** " + strings.Join(storedNames, ", ") + "\n\n"
+	}
+	if len(dirs) > 0 {
+		suggestion += "**Auto-generatable from directories:** " + strings.Join(dirs, ", ") + "\n\n"
+	}
+	suggestion += "Use one of the names above, or create a profile via the web UI."
+	return mcp.NewToolResultError(suggestion), nil
+}
+
+// handleFindSimilar handles the find_similar tool
+func (m *MCPServer) handleFindSimilar(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	args, ok := request.Params.Arguments.(map[string]interface{})
+	if !ok {
+		return mcp.NewToolResultError("invalid arguments"), nil
+	}
+
+	functionID, ok := args["function_id"].(string)
+	if !ok || functionID == "" {
+		return mcp.NewToolResultError("function_id is required"), nil
+	}
+
+	limit := 5
+	if l, ok := args["limit"].(float64); ok && l > 0 {
+		limit = int(l)
+	}
+
+	threshold := float32(0.75)
+	if t, ok := args["threshold"].(float64); ok && t > 0 {
+		threshold = float32(t)
+	}
+
+	m.logger.Printf("🔍 find_similar: function_id='%s' limit=%d threshold=%.2f", functionID, limit, threshold)
+
+	node, err := m.graph.GetNode(functionID)
+	if err != nil || node == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("function '%s' not found", functionID)), nil
+	}
+
+	// Get embedding for the source node
+	sourceEmbedding, err := m.vector.Get(functionID)
+	if err != nil || sourceEmbedding == nil {
+		// Compute on the fly if not stored
+		text := vector.BuildEmbedText(node.Name, node.Type, node.Signature, "", node.Body)
+		sourceEmbedding, err = m.embedder.Embed(text)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("could not embed function: %v", err)), nil
+		}
+	}
+
+	results, err := m.vector.SearchWithThreshold(sourceEmbedding, threshold)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search error: %v", err)), nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## Similar functions to `%s`\n\n", node.Name))
+	sb.WriteString(fmt.Sprintf("*Threshold: %.0f%%, top %d results*\n\n", threshold*100, limit))
+
+	count := 0
+	for _, r := range results {
+		if r.NodeID == functionID {
+			continue
+		}
+		similar, err := m.graph.GetNode(r.NodeID)
+		if err != nil || similar == nil {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("### %.0f%% — `%s` (%s:%d)\n", r.Similarity*100, similar.Name, similar.File, similar.Line))
+		if similar.Signature != "" {
+			sb.WriteString(fmt.Sprintf("```\n%s\n```\n", similar.Signature))
+		}
+		sb.WriteString("\n")
+		count++
+		if count >= limit {
+			break
+		}
 	}
 
 	if count == 0 {
-		return mcp.NewToolResultError(fmt.Sprintf("profile '%s' has no nodes. Add nodes via the UI.", name)), nil
+		sb.WriteString("No similar functions found above the threshold.\n")
 	}
 
-	m.logger.Printf("📦 Profile '%s': %d nodes, ~%d tokens", name, count, totalTokens)
-	return mcp.NewToolResultText(result.String()), nil
+	elapsed := time.Since(start)
+	m.logger.Printf("✅ find_similar: %d results in %v", count, elapsed)
+	return mcp.NewToolResultText(sb.String()), nil
 }
+
+func findNodeBySymbol(nodes []models.GraphNode, symbol string) *models.GraphNode {
+	candidates := symbolCandidates(symbol)
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// 1) Exact/normalized ID match
+	for i := range nodes {
+		nodeIDSlash := strings.ReplaceAll(nodes[i].ID, `\`, "/")
+		for _, candidate := range candidates {
+			if nodes[i].ID == candidate || strings.EqualFold(nodes[i].ID, candidate) {
+				return &nodes[i]
+			}
+			candidateSlash := strings.ReplaceAll(candidate, `\`, "/")
+			if nodeIDSlash == candidateSlash || strings.EqualFold(nodeIDSlash, candidateSlash) {
+				return &nodes[i]
+			}
+		}
+	}
+
+	// 2) Name match (exact first)
+	for i := range nodes {
+		for _, candidate := range candidates {
+			if nodes[i].Name == candidate {
+				return &nodes[i]
+			}
+		}
+	}
+
+	// 3) Name suffix match for qualified names (e.g., Class.method -> method)
+	for i := range nodes {
+		for _, candidate := range candidates {
+			if strings.EqualFold(nodes[i].Name, candidate) {
+				return &nodes[i]
+			}
+			if idx := strings.LastIndex(nodes[i].Name, "."); idx >= 0 && idx+1 < len(nodes[i].Name) {
+				if nodes[i].Name[idx+1:] == candidate || strings.EqualFold(nodes[i].Name[idx+1:], candidate) {
+					return &nodes[i]
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func symbolCandidates(symbol string) []string {
+	symbol = strings.TrimSpace(symbol)
+	if symbol == "" {
+		return nil
+	}
+
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+
+	add(symbol)
+	if idx := strings.LastIndex(symbol, ":"); idx >= 0 && idx+1 < len(symbol) {
+		add(symbol[idx+1:])
+	}
+	if idx := strings.LastIndex(symbol, "::"); idx >= 0 && idx+2 < len(symbol) {
+		add(symbol[idx+2:])
+	}
+	if idx := strings.LastIndex(symbol, "."); idx >= 0 && idx+1 < len(symbol) {
+		add(symbol[idx+1:])
+	}
+
+	return out
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // formatNodesResult formats a list of nodes
 func formatNodesResult(nodes []models.GraphNode) *mcp.CallToolResult {
 	if len(nodes) == 0 {
