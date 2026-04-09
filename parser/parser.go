@@ -40,6 +40,9 @@ func IsCodeFile(filename string) bool {
 
 // ShouldSkipPath verifica si debemos saltar este path
 func ShouldSkipPath(path string) bool {
+	// normalize Windows separators
+	path = strings.ReplaceAll(path, "\\", "/")
+
 	skipDirs := []string{
 		"node_modules",
 		"__pycache__",

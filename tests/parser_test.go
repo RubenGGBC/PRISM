@@ -146,6 +146,7 @@ func TestShouldSkipPath_Worktrees(t *testing.T) {
 	}{
 		{".claude/worktrees/agent-abc123/main.go", true},
 		{".worktrees/feature-branch/src/foo.go", true},
+		{".claude\\worktrees\\agent-abc123\\main.go", true},
 		{"src/main.go", false},
 		{"WhoIsThisPokemon/src/main.go", false},
 	}
