@@ -44,6 +44,8 @@ func ShouldSkipPath(path string) bool {
 		"node_modules",
 		"__pycache__",
 		".git",
+		".claude",
+		".worktrees",
 		".venv",
 		"venv",
 		"env",

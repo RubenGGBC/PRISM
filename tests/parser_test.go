@@ -138,3 +138,21 @@ func elementNames(result *parser.ParsedFile) []string {
 	}
 	return names
 }
+
+func TestShouldSkipPath_Worktrees(t *testing.T) {
+	cases := []struct {
+		path   string
+		expect bool
+	}{
+		{".claude/worktrees/agent-abc123/main.go", true},
+		{".worktrees/feature-branch/src/foo.go", true},
+		{"src/main.go", false},
+		{"WhoIsThisPokemon/src/main.go", false},
+	}
+	for _, c := range cases {
+		got := parser.ShouldSkipPath(c.path)
+		if got != c.expect {
+			t.Errorf("ShouldSkipPath(%q) = %v, want %v", c.path, got, c.expect)
+		}
+	}
+}
