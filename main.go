@@ -21,6 +21,17 @@ import (
 	"github.com/ruffini/prism/watcher"
 )
 
+var manifestFiles = []string{"go.mod", "package.json", "Cargo.toml", "pyproject.toml", "pom.xml"}
+
+func isProjectRoot(dir string) bool {
+	for _, m := range manifestFiles {
+		if _, err := os.Stat(filepath.Join(dir, m)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -258,6 +269,7 @@ func indexRepository(repoPath string) {
 		}
 
 		relPath, _ := filepath.Rel(repoPath, path)
+		relPath = filepath.ToSlash(relPath)
 
 		parsed, err := p.ParseFile(path)
 		if err != nil {
@@ -268,6 +280,7 @@ func indexRepository(repoPath string) {
 		parsed.Path = relPath
 		for i := range parsed.Elements {
 			parsed.Elements[i].File = relPath
+			parsed.Elements[i].ID = relPath + ":" + parsed.Elements[i].Name
 		}
 		parsedFiles[relPath] = parsed
 		totalFiles++
@@ -753,7 +766,20 @@ func indexRepositoryToGraph(repoPath string, codeGraph *graph.CodeGraph) error {
 			return nil
 		}
 
-		relPath, _ := filepath.Rel(repoPath, path)
+		// Find nearest project root at or below repoPath for this file
+		base := repoPath
+		dir := filepath.Dir(path)
+		for dir != repoPath && dir != filepath.Dir(dir) {
+			if isProjectRoot(dir) {
+				base = dir
+				break
+			}
+			dir = filepath.Dir(dir)
+		}
+
+		relPath, _ := filepath.Rel(base, path)
+		relPath = filepath.ToSlash(relPath)
+
 		parsed, err := p.ParseFile(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  ⚠ Error parsing %s: %v\n", relPath, err)
@@ -763,6 +789,7 @@ func indexRepositoryToGraph(repoPath string, codeGraph *graph.CodeGraph) error {
 		parsed.Path = relPath
 		for i := range parsed.Elements {
 			parsed.Elements[i].File = relPath
+			parsed.Elements[i].ID = relPath + ":" + parsed.Elements[i].Name
 		}
 		parsedFiles[relPath] = parsed
 		totalFiles++

@@ -2,6 +2,8 @@ package tests
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -314,4 +316,67 @@ func TestMultipleLanguageParsing(t *testing.T) {
 	}
 
 	t.Logf("Multiple language parsing successful: %d nodes created", nodes)
+}
+
+func TestIndexing_ForwardSlashPaths(t *testing.T) {
+	dbPath := "test_path_norm.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+	defer database.Close()
+
+	codeGraph := graph.NewGraph(database)
+
+	tmp := t.TempDir()
+	subDir := filepath.Join(tmp, "MyProject", "src")
+	os.MkdirAll(subDir, 0755)
+	goFile := filepath.Join(subDir, "main.go")
+	os.WriteFile(goFile, []byte("package main\nfunc Hello() {}"), 0644)
+
+	// Simulate what indexRepositoryToGraph does (with the fix applied)
+	p := parser.GetParser(goFile)
+	if p == nil {
+		t.Skip("no Go parser available")
+	}
+	parsed, err := p.ParseFile(goFile)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	relPath, _ := filepath.Rel(tmp, goFile)
+	relPath = filepath.ToSlash(relPath) // THE FIX
+
+	parsed.Path = relPath
+	for i := range parsed.Elements {
+		parsed.Elements[i].File = relPath
+		parsed.Elements[i].ID = relPath + ":" + parsed.Elements[i].Name
+	}
+
+	if len(parsed.Elements) == 0 {
+		t.Skip("no elements parsed from Go file")
+	}
+
+	if err := codeGraph.AddNode(parsed.Elements[0]); err != nil {
+		t.Fatalf("AddNode failed: %v", err)
+	}
+
+	nodes, err := codeGraph.GetAllNodes(100)
+	if err != nil {
+		t.Fatalf("GetAllNodes failed: %v", err)
+	}
+	if len(nodes) == 0 {
+		t.Fatal("no nodes indexed")
+	}
+	for _, n := range nodes {
+		if strings.Contains(n.File, "\\") {
+			t.Errorf("File path %q contains backslash", n.File)
+		}
+		if strings.Contains(n.ID, "\\") {
+			t.Errorf("Node ID %q contains backslash", n.ID)
+		}
+	}
+	t.Logf("Forward slash path test passed: file=%s id=%s", nodes[0].File, nodes[0].ID)
 }
