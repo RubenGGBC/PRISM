@@ -415,7 +415,7 @@ func startMCPServer(dbPath, vectorPath, ollamaURL, embedModel, repoPath string, 
 	apiServer.RegisterRoutes(mux)
 
 	go func() {
-		fmt.Printf("🌐 HTTP API server listening on http://localhost:8080\n")
+		fmt.Fprintf(os.Stderr, "🌐 HTTP API server listening on http://localhost:8080\n")
 		if err := http.ListenAndServe(":8080", mux); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ HTTP server error: %v\n", err)
 		}
@@ -426,7 +426,7 @@ func startMCPServer(dbPath, vectorPath, ollamaURL, embedModel, repoPath string, 
 
 	// Try to start MCP server, but don't fail if stdin is closed
 	go func() {
-		fmt.Println("📡 MCP server ready (stdio transport)")
+		fmt.Fprintln(os.Stderr, "📡 MCP server ready (stdio transport)")
 		if err := mcpServer.Start(); err != nil {
 			// Ignore EOF errors from stdin
 			fmt.Fprintf(os.Stderr, "⚠️  MCP connection closed\n")
